@@ -1,0 +1,18 @@
+# Builds a preview of every pull request, including ones from forks.
+name: PR preview
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm ci && npm run build
+      - uses: example-org/deploy-preview@v2
+        with:
+          token: ${{ secrets.DEPLOY_TOKEN }}

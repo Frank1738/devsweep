@@ -1,0 +1,22 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: write-all
+
+jobs:
+  build:
+    uses: example-org/shared-workflows/.github/workflows/build.yml@main
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker://alpine:3.20
+      - uses: example-org/create-release@v2
+      - uses: example-org/notify@3d3c42e5aac5ba805825da76410c181273ba90b1 # v1.4.0
+      - run: |
+          git tag -f v1
+          git push --force origin v1

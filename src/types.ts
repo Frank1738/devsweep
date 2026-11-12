@@ -11,6 +11,8 @@ export interface Rule {
   severity: Severity;
   /** Why this is a risk. Used for help text and SARIF rule descriptions. */
   description: string;
+  /** How to fix it in general. Findings carry their own, more specific advice. */
+  remediation: string;
 }
 
 export interface Position {

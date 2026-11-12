@@ -2,17 +2,21 @@
 
 Scan your dev setup and repos for the supply-chain and credential risks that infostealers exploit.
 
-> **Status:** early development. Phase 1 of 4 (workflow scanning) is built. See [docs/PLAN.md](docs/PLAN.md).
+> **Status:** early development. Workflow scanning works, and GitHub integration (SARIF output and a GitHub Action) is under way.
 
 ## Usage
 
 ```sh
 npm install
 npm run build
-node dist/bin.js [path]             # scan a folder (default: the current one)
-node dist/bin.js [path] --details   # explain each finding, with the code and the fix
-node dist/bin.js [path] --json      # machine-readable output
+node dist/bin.js [path]                  # scan a folder (default: the current one)
+node dist/bin.js [path] --details        # explain each finding, with the code and the fix
+node dist/bin.js [path] --json           # machine-readable output
+node dist/bin.js [path] --sarif          # SARIF 2.1.0, the format GitHub's Security tab reads
+node dist/bin.js [path] --sarif -o FILE  # save the report to FILE, and show the readable one
 ```
+
+`-o`/`--output` works with `--json` and `--sarif`. It creates missing folders, and the terminal (or CI log) still lists the findings.
 
 Example output:
 
@@ -45,6 +49,19 @@ In a terminal, devsweep opens with a gradient banner that sweeps in, and shows a
 | `workflow/force-push`            | high, medium or low | A workflow that force-pushes. High for `main`, `master`, tags and mirrors; medium for other branches; low for `gh-pages` |
 
 Checks for whether force pushes are allowed on the default branch and tags, and whether any happened recently, come in Phase 2. Dependency and secret checks come in Phase 3.
+
+### SARIF output
+
+`--sarif` writes [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/sarif-v2.1.0-errata01-os-complete.html) in the subset that [GitHub code scanning](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning) reads. Each finding's severity maps to a SARIF level and to the score GitHub uses for the alert's severity:
+
+| devsweep | SARIF level | GitHub security severity |
+| -------- | ----------- | ------------------------ |
+| critical | `error`     | 9.5 (critical)           |
+| high     | `error`     | 8.0 (high)               |
+| medium   | `warning`   | 5.5 (medium)             |
+| low      | `note`      | 2.0 (low)                |
+
+File paths are relative to the repository root, even when you scan a subfolder. The report contains no timestamps or absolute paths, so it's safe to share. Skipped files and failed checks are listed under `invocations`.
 
 ## Development
 

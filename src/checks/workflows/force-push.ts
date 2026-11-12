@@ -12,6 +12,10 @@ export const forcePush: Rule = {
     'compromises the workflow, through a malicious dependency, action or injected script, can ' +
     'use it to hide what they changed. Severity depends on the target: high for main, master, ' +
     'tags and mirrors, medium for other branches, low for deploy branches such as gh-pages.',
+  remediation:
+    'Push without force where possible, so a diverged branch fails instead of being ' +
+    'overwritten. Block force pushes on the default branch and release tags with a ruleset, ' +
+    'and allow them only where a workflow needs them, such as a gh-pages deploy branch.',
 };
 
 export const rules = [forcePush] as const;

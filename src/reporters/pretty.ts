@@ -2,6 +2,7 @@ import path from 'node:path';
 import pc from 'picocolors';
 import { rules } from '../checks/index.js';
 import { type Finding, type ScanResult, SEVERITIES, type Severity } from '../types.js';
+import { markedSpan, type ReadLines } from './source.js';
 import { summarize } from './summary.js';
 
 export interface PrettyOptions {
@@ -15,7 +16,7 @@ export interface PrettyOptions {
   /** Terminal width in columns. Without it, nothing is shortened or wrapped to fit. */
   width?: number | undefined;
   /** Reads a scanned file's lines, for code excerpts in details mode. */
-  readLines?: ((file: string) => string[] | undefined) | undefined;
+  readLines?: ReadLines | undefined;
 }
 
 type Colors = ReturnType<typeof pc.createColors>;
@@ -146,8 +147,9 @@ function codeExcerpt(
     lines.push(`${c.dim(`${String(f.line - 1).padStart(gutter)} │`)} ${c.dim(show(above))}`);
   lines.push(`${c.dim(`${String(f.line).padStart(gutter)} │`)} ${show(target)}`);
 
-  const from = f.column !== undefined ? f.column - 1 : target.length - target.trimStart().length;
-  const to = Math.min(target.trimEnd().length, room - 1);
+  const span = markedSpan(target, f.column);
+  const from = span.start;
+  const to = Math.min(span.end, room - 1);
   if (to > from) {
     lines.push(
       `${c.dim(`${' '.repeat(gutter)} │`)} ${' '.repeat(from)}${paint('^'.repeat(to - from))}`,

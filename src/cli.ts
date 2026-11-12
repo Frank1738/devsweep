@@ -1,9 +1,14 @@
-import { readFileSync } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { Command, CommanderError } from 'commander';
+import { Command, CommanderError, Option } from 'commander';
+import pc from 'picocolors';
+import { findRepository } from './git.js';
 import { formatJson } from './reporters/json.js';
 import { formatPretty } from './reporters/pretty.js';
+import { formatSarif } from './reporters/sarif.js';
+import { type ReadLines, sourceReader } from './reporters/source.js';
 import { ScanTargetError, scan } from './scanner.js';
+import type { ScanResult } from './types.js';
 import { bannerFits, playBanner, renderBanner } from './ui/banner.js';
 import { startSweep } from './ui/sweep.js';
 import { sleep } from './ui/terminal.js';
@@ -25,10 +30,15 @@ export const EXIT_TOOL_ERROR = 2;
 
 interface ScanFlags {
   json?: boolean;
+  sarif?: boolean;
+  /** Where to save the --json or --sarif report. */
+  output?: string;
   details?: boolean;
   /** False when --no-color is passed. */
   color?: boolean;
 }
+
+type MachineFormat = 'json' | 'sarif';
 
 /** Runs the CLI with `argv` (user arguments only) and returns the exit code. */
 export async function main(argv: readonly string[], io: Io): Promise<number> {
@@ -48,57 +58,90 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
     program.addHelpText('beforeAll', `\n${banner.join('\n')}\n`);
   }
 
-  program
+  const scanCommand = program
     .command('scan', { isDefault: true })
     .description('scan a repository for risky settings (the default command)')
     .argument('[path]', 'directory to scan', '.')
     .option('-d, --details', 'explain each finding and how to fix it')
     .option('--json', 'print results as JSON')
-    .option('--no-color', 'turn off colors')
-    .action(async (target: string, flags: ScanFlags) => {
-      const color = io.color && flags.color !== false;
-      const animate = io.interactive && !flags.json;
-      const banner = animate && bannerFits(io.width);
-      const shownTarget = displayTarget(target);
+    .addOption(
+      new Option('--sarif', 'print results as SARIF 2.1.0, for GitHub code scanning').conflicts(
+        'json',
+      ),
+    )
+    .option(
+      '-o, --output <file>',
+      'save the --json or --sarif report to a file, and show the readable report',
+    )
+    .option('--no-color', 'turn off colors');
 
-      // Start scanning right away, so the work overlaps the animations.
-      let scanned = false;
-      const scanning = settle(scan({ root: target })).finally(() => {
-        scanned = true;
-      });
-      if (banner) await playBanner(io.stdout, { color, version: VERSION, width: io.width });
-      // The sweep shows progress, so skip it when the scan finished while the banner drew.
-      const stopSweep =
-        animate && !(banner && scanned)
-          ? startSweep({ write: io.stdout, label: shownTarget, color, width: io.width })
-          : undefined;
-      const outcome = await scanning;
-      await stopSweep?.();
+  scanCommand.action(async (target: string, flags: ScanFlags) => {
+    const machine = machineFormat(flags);
+    if (flags.output !== undefined && !machine) {
+      scanCommand.error('error: --output needs --json or --sarif');
+    }
+    // The readable report shows unless a machine format is going to stdout.
+    const readable = !machine || flags.output !== undefined;
+    const color = io.color && flags.color !== false;
+    const animate = io.interactive && readable;
+    const banner = animate && bannerFits(io.width);
+    const shownTarget = displayTarget(target);
 
-      if (!outcome.ok) {
-        if (!(outcome.error instanceof ScanTargetError)) throw outcome.error;
-        io.stderr(`devsweep: ${outcome.error.message}\n`);
-        exitCode = EXIT_TOOL_ERROR;
-        return;
-      }
-      const result = outcome.value;
-
-      if (flags.json) {
-        io.stdout(formatJson(result, VERSION));
-      } else {
-        const report = formatPretty(result, {
-          target: shownTarget,
-          color,
-          showName: !banner,
-          details: flags.details,
-          width: io.width,
-          readLines: sourceReader(result.root),
-        });
-        if (animate) await reveal(io, report);
-        else io.stdout(report);
-      }
-      if (result.errors.length > 0) exitCode = EXIT_TOOL_ERROR;
+    // Start scanning right away, so the work overlaps the animations.
+    let scanned = false;
+    const scanning = settle(scan({ root: target })).finally(() => {
+      scanned = true;
     });
+    if (banner) await playBanner(io.stdout, { color, version: VERSION, width: io.width });
+    // The sweep shows progress, so skip it when the scan finished while the banner drew.
+    const stopSweep =
+      animate && !(banner && scanned)
+        ? startSweep({ write: io.stdout, label: shownTarget, color, width: io.width })
+        : undefined;
+    const outcome = await scanning;
+    await stopSweep?.();
+
+    if (!outcome.ok) {
+      if (!(outcome.error instanceof ScanTargetError)) throw outcome.error;
+      io.stderr(`devsweep: ${outcome.error.message}\n`);
+      exitCode = EXIT_TOOL_ERROR;
+      return;
+    }
+    const result = outcome.value;
+    const readLines = sourceReader(result.root);
+
+    if (machine) {
+      const report = await formatMachine(machine, result, readLines);
+      if (flags.output === undefined) {
+        io.stdout(report);
+      } else {
+        const failure = await saveReport(flags.output, report);
+        if (failure) {
+          io.stderr(`devsweep: ${failure}\n`);
+          exitCode = EXIT_TOOL_ERROR;
+          return;
+        }
+      }
+    }
+
+    if (readable) {
+      let report = formatPretty(result, {
+        target: shownTarget,
+        color,
+        showName: !banner,
+        details: flags.details,
+        width: io.width,
+        readLines,
+      });
+      if (machine && flags.output !== undefined) {
+        const name = machine === 'sarif' ? 'SARIF' : 'JSON';
+        report += `  ${pc.createColors(color).dim(`${name} report saved to ${flags.output}`)}\n`;
+      }
+      if (animate) await reveal(io, report);
+      else io.stdout(report);
+    }
+    if (result.errors.length > 0) exitCode = EXIT_TOOL_ERROR;
+  });
 
   try {
     await program.parseAsync(argv, { from: 'user' });
@@ -137,17 +180,35 @@ async function reveal(io: Io, report: string, durationMs = 180): Promise<void> {
   }
 }
 
-/** Reads scanned files on demand, for code excerpts in --details output. */
-function sourceReader(root: string): (file: string) => string[] | undefined {
-  const cache = new Map<string, string[] | undefined>();
-  return (file) => {
-    if (!cache.has(file)) {
-      try {
-        cache.set(file, readFileSync(path.join(root, file), 'utf8').split(/\r?\n/));
-      } catch {
-        cache.set(file, undefined);
-      }
-    }
-    return cache.get(file);
-  };
+function machineFormat(flags: ScanFlags): MachineFormat | undefined {
+  if (flags.sarif) return 'sarif';
+  if (flags.json) return 'json';
+  return undefined;
+}
+
+async function formatMachine(
+  format: MachineFormat,
+  result: ScanResult,
+  readLines: ReadLines,
+): Promise<string> {
+  if (format === 'json') return formatJson(result, VERSION);
+  // GitHub needs paths from the repository root, even when only a subfolder was scanned.
+  const repository = await findRepository(result.root);
+  return formatSarif(result, {
+    version: VERSION,
+    pathFromRepoRoot: repository?.pathFromRoot,
+    readLines,
+  });
+}
+
+/** Writes a report, creating missing folders. Returns what went wrong, if anything. */
+async function saveReport(file: string, text: string): Promise<string | undefined> {
+  try {
+    await mkdir(path.dirname(path.resolve(file)), { recursive: true });
+    await writeFile(file, text, 'utf8');
+    return undefined;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return `Couldn't save the report to ${file}: ${detail}`;
+  }
 }

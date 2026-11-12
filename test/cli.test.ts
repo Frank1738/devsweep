@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EXIT_OK, EXIT_TOOL_ERROR, main } from '../src/cli.js';
 import { VERSION } from '../src/version.js';
 import { fixture } from './helpers.js';
@@ -149,5 +152,100 @@ describe('devsweep scan', () => {
     const { code, stdout } = await run('--version');
     expect(code).toBe(EXIT_OK);
     expect(stdout.trim()).toBe(VERSION);
+  });
+});
+
+describe('devsweep scan --sarif and --output', () => {
+  let temp: string;
+
+  beforeEach(async () => {
+    temp = await mkdtemp(path.join(os.tmpdir(), 'devsweep-cli-'));
+  });
+
+  afterEach(async () => {
+    await rm(temp, { recursive: true, force: true });
+  });
+
+  it('prints SARIF with --sarif', async () => {
+    const { code, stdout } = await run('scan', fixture('vulnerable-repo'), '--sarif');
+    expect(code).toBe(EXIT_OK);
+    const sarif = JSON.parse(stdout);
+    expect(sarif.version).toBe('2.1.0');
+    expect(sarif.runs[0].tool.driver).toMatchObject({ name: 'devsweep', version: VERSION });
+    expect(sarif.runs[0].results).toHaveLength(10);
+  });
+
+  it('prints only plain SARIF to stdout, even in an interactive terminal', async () => {
+    let stdout = '';
+    await main([fixture('vulnerable-repo'), '--sarif'], {
+      stdout: (text) => {
+        stdout += text;
+      },
+      stderr: () => {},
+      color: true,
+      interactive: true,
+      width: 100,
+    });
+    expect(stdout).not.toContain('\u001b[');
+    expect(JSON.parse(stdout).runs[0].results).toHaveLength(10);
+  });
+
+  it('rejects --sarif with --json', async () => {
+    const { code, stdout, stderr } = await run('scan', fixture('clean-repo'), '--sarif', '--json');
+    expect(code).not.toBe(EXIT_OK);
+    expect(stdout).toBe('');
+    expect(stderr).toContain("option '--sarif' cannot be used with option '--json'");
+  });
+
+  it('rejects --output without --json or --sarif', async () => {
+    const out = path.join(temp, 'report.txt');
+    const { code, stderr } = await run('scan', fixture('clean-repo'), '-o', out);
+    expect(code).not.toBe(EXIT_OK);
+    expect(stderr).toContain('--output needs --json or --sarif');
+  });
+
+  it('saves SARIF with --output, creating folders, and still shows the readable report', async () => {
+    const out = path.join(temp, 'reports', 'devsweep.sarif');
+    const { code, stdout } = await run('scan', fixture('vulnerable-repo'), '--sarif', '-o', out);
+    expect(code).toBe(EXIT_OK);
+    expect(JSON.parse(await readFile(out, 'utf8')).runs[0].results).toHaveLength(10);
+    expect(stdout).toContain('10 issues');
+    expect(lastLines(stdout, 1)).toEqual([`  SARIF report saved to ${out}`]);
+  });
+
+  it('saves JSON with --output', async () => {
+    const out = path.join(temp, 'devsweep.json');
+    const { code, stdout } = await run(
+      'scan',
+      fixture('vulnerable-repo'),
+      '--json',
+      '--output',
+      out,
+    );
+    expect(code).toBe(EXIT_OK);
+    expect(JSON.parse(await readFile(out, 'utf8')).summary.total).toBe(10);
+    expect(lastLines(stdout, 1)).toEqual([`  JSON report saved to ${out}`]);
+  });
+
+  it('exits with a tool error when the report can’t be saved', async () => {
+    const { code, stderr } = await run('scan', fixture('clean-repo'), '--sarif', '-o', temp);
+    expect(code).toBe(EXIT_TOOL_ERROR);
+    expect(stderr).toMatch(/^devsweep: Couldn't save the report to /);
+  });
+
+  it('writes SARIF paths from the repository root when scanning a subfolder', async () => {
+    const workflows = path.join(temp, 'tools', '.github', 'workflows');
+    await mkdir(path.join(temp, '.git'));
+    await mkdir(workflows, { recursive: true });
+    await writeFile(
+      path.join(workflows, 'ci.yml'),
+      'on: push\npermissions: {}\njobs:\n  a:\n    steps:\n      - uses: example-org/x@v1\n',
+    );
+    const { stdout } = await run('scan', path.join(temp, 'tools'), '--sarif');
+    const [result] = JSON.parse(stdout).runs[0].results;
+    expect(result.locations[0].physicalLocation.artifactLocation).toEqual({
+      uri: 'tools/.github/workflows/ci.yml',
+      uriBaseId: '%SRCROOT%',
+    });
   });
 });

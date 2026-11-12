@@ -10,6 +10,10 @@ export const untrustedCheckout: Rule = {
     'Workflows triggered by pull_request_target run with repository secrets and a GITHUB_TOKEN ' +
     'that can write. Checking out the pull request head lets anyone who opens a PR from a fork ' +
     'run their own code with those secrets (a "pwn request").',
+  remediation:
+    'Switch to the pull_request trigger, or split the work: build untrusted code in a ' +
+    'pull_request workflow with no secrets, then act on its results in a separate ' +
+    'workflow_run workflow.',
 };
 
 export const pullRequestTarget: Rule = {
@@ -20,6 +24,9 @@ export const pullRequestTarget: Rule = {
     'pull_request_target runs in the context of the base repository, with secrets and a ' +
     'GITHUB_TOKEN that can write, even for pull requests from forks. It is safe only if the ' +
     'workflow never checks out, builds or runs code from the pull request.',
+  remediation:
+    'Use the pull_request trigger unless the workflow needs secrets or write access. If it ' +
+    'does, never check out or run code from the pull request.',
 };
 
 export const rules = [untrustedCheckout, pullRequestTarget] as const;
@@ -56,9 +63,7 @@ export function analyze(workflow: Workflow): Finding[] {
       message:
         'Workflow is triggered by pull_request_target, so it runs with secrets and a write token ' +
         'for pull requests from forks.',
-      remediation:
-        'Use the pull_request trigger unless the workflow needs secrets or write access. If it ' +
-        'does, never check out or run code from the pull request.',
+      remediation: pullRequestTarget.remediation,
     }),
   ];
 }
@@ -84,9 +89,6 @@ function checkoutFinding(
     message:
       `Job "${jobId}" runs on pull_request_target and ${what}, so code from any fork can run ` +
       "with this repository's secrets and write token.",
-    remediation:
-      'Switch to the pull_request trigger, or split the work: build untrusted code in a ' +
-      'pull_request workflow with no secrets, then act on its results in a separate ' +
-      'workflow_run workflow.',
+    remediation: untrustedCheckout.remediation,
   });
 }

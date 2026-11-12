@@ -10,6 +10,9 @@ export const missingPermissions: Rule = {
     'repository or organization settings. On older repositories and many organizations that ' +
     'default is read and write for every scope, so any compromised step can push code, edit ' +
     'releases or approve pull requests.',
+  remediation:
+    'Set "permissions: contents: read" at the top of the workflow, and grant extra scopes ' +
+    'only to the jobs that need them.',
 };
 
 export const writeAllPermissions: Rule = {
@@ -19,13 +22,12 @@ export const writeAllPermissions: Rule = {
   description:
     'permissions: write-all gives the GITHUB_TOKEN write access to code, packages, releases, ' +
     'issues, pull requests and more. Any compromised step can use it.',
+  remediation:
+    'List only the scopes the workflow needs, e.g. "contents: read", and grant write scopes ' +
+    'only to the jobs that need them.',
 };
 
 export const rules = [writeAllPermissions, missingPermissions] as const;
-
-const LEAST_PRIVILEGE_FIX =
-  'Set "permissions: contents: read" at the top of the workflow, and grant extra scopes only ' +
-  'to the jobs that need them.';
 
 export function analyze(workflow: Workflow): Finding[] {
   const findings: Finding[] = [];
@@ -72,7 +74,7 @@ export function analyze(workflow: Workflow): Finding[] {
           message:
             `No top-level permissions block, and ${jobs} the repository's default GITHUB_TOKEN ` +
             'permissions.',
-          remediation: LEAST_PRIVILEGE_FIX,
+          remediation: missingPermissions.remediation,
         }),
       );
     }

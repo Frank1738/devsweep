@@ -9,6 +9,11 @@ export const unpinnedAction: Rule = {
     'Tags and branches can be moved to point at different code at any time. If the owner of a ' +
     'third-party action is compromised, every workflow that references it by tag runs the ' +
     "attacker's code with that workflow's secrets. Only a full commit SHA is immutable.",
+  remediation:
+    'Pin third-party actions and reusable workflows to a full 40-character commit SHA, with ' +
+    'the version in a comment (uses: owner/action@<sha> # v1.2.3), and pin container images ' +
+    'by digest (docker://image@sha256:<digest>). Dependabot and Renovate can keep the pins up ' +
+    'to date.',
 };
 
 export const rules = [unpinnedAction] as const;

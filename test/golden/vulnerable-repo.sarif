@@ -1,0 +1,447 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "devsweep",
+          "version": "0.0.0-test",
+          "semanticVersion": "0.0.0-test",
+          "informationUri": "https://github.com/Frank1738/devsweep",
+          "rules": [
+            {
+              "id": "workflow/untrusted-checkout",
+              "shortDescription": {
+                "text": "Runs pull request code with secrets"
+              },
+              "fullDescription": {
+                "text": "Workflows triggered by pull_request_target run with repository secrets and a GITHUB_TOKEN that can write. Checking out the pull request head lets anyone who opens a PR from a fork run their own code with those secrets (a \"pwn request\")."
+              },
+              "help": {
+                "text": "Workflows triggered by pull_request_target run with repository secrets and a GITHUB_TOKEN that can write. Checking out the pull request head lets anyone who opens a PR from a fork run their own code with those secrets (a \"pwn request\").\n\nHow to fix: Switch to the pull_request trigger, or split the work: build untrusted code in a pull_request workflow with no secrets, then act on its results in a separate workflow_run workflow.",
+                "markdown": "Workflows triggered by pull\\_request\\_target run with repository secrets and a GITHUB\\_TOKEN that can write. Checking out the pull request head lets anyone who opens a PR from a fork run their own code with those secrets (a \"pwn request\").\n\n## How to fix\n\nSwitch to the pull\\_request trigger, or split the work: build untrusted code in a pull\\_request workflow with no secrets, then act on its results in a separate workflow\\_run workflow."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "workflow"
+                ],
+                "precision": "high",
+                "security-severity": "9.5"
+              }
+            },
+            {
+              "id": "workflow/pull-request-target",
+              "shortDescription": {
+                "text": "Uses the pull_request_target trigger"
+              },
+              "fullDescription": {
+                "text": "pull_request_target runs in the context of the base repository, with secrets and a GITHUB_TOKEN that can write, even for pull requests from forks. It is safe only if the workflow never checks out, builds or runs code from the pull request."
+              },
+              "help": {
+                "text": "pull_request_target runs in the context of the base repository, with secrets and a GITHUB_TOKEN that can write, even for pull requests from forks. It is safe only if the workflow never checks out, builds or runs code from the pull request.\n\nHow to fix: Use the pull_request trigger unless the workflow needs secrets or write access. If it does, never check out or run code from the pull request.",
+                "markdown": "pull\\_request\\_target runs in the context of the base repository, with secrets and a GITHUB\\_TOKEN that can write, even for pull requests from forks. It is safe only if the workflow never checks out, builds or runs code from the pull request.\n\n## How to fix\n\nUse the pull\\_request trigger unless the workflow needs secrets or write access. If it does, never check out or run code from the pull request."
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "workflow"
+                ],
+                "precision": "high",
+                "security-severity": "5.5"
+              }
+            },
+            {
+              "id": "workflow/unpinned-action",
+              "shortDescription": {
+                "text": "Unpinned action"
+              },
+              "fullDescription": {
+                "text": "Tags and branches can be moved to point at different code at any time. If the owner of a third-party action is compromised, every workflow that references it by tag runs the attacker's code with that workflow's secrets. Only a full commit SHA is immutable."
+              },
+              "help": {
+                "text": "Tags and branches can be moved to point at different code at any time. If the owner of a third-party action is compromised, every workflow that references it by tag runs the attacker's code with that workflow's secrets. Only a full commit SHA is immutable.\n\nHow to fix: Pin third-party actions and reusable workflows to a full 40-character commit SHA, with the version in a comment (uses: owner/action@<sha> # v1.2.3), and pin container images by digest (docker://image@sha256:<digest>). Dependabot and Renovate can keep the pins up to date.",
+                "markdown": "Tags and branches can be moved to point at different code at any time. If the owner of a third-party action is compromised, every workflow that references it by tag runs the attacker's code with that workflow's secrets. Only a full commit SHA is immutable.\n\n## How to fix\n\nPin third-party actions and reusable workflows to a full 40-character commit SHA, with the version in a comment (uses: owner/action@\\<sha\\> # v1.2.3), and pin container images by digest (docker://image@sha256:\\<digest\\>). Dependabot and Renovate can keep the pins up to date."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "workflow"
+                ],
+                "precision": "high",
+                "security-severity": "8.0"
+              }
+            },
+            {
+              "id": "workflow/write-all-permissions",
+              "shortDescription": {
+                "text": "Token can write to everything"
+              },
+              "fullDescription": {
+                "text": "permissions: write-all gives the GITHUB_TOKEN write access to code, packages, releases, issues, pull requests and more. Any compromised step can use it."
+              },
+              "help": {
+                "text": "permissions: write-all gives the GITHUB_TOKEN write access to code, packages, releases, issues, pull requests and more. Any compromised step can use it.\n\nHow to fix: List only the scopes the workflow needs, e.g. \"contents: read\", and grant write scopes only to the jobs that need them.",
+                "markdown": "permissions: write-all gives the GITHUB\\_TOKEN write access to code, packages, releases, issues, pull requests and more. Any compromised step can use it.\n\n## How to fix\n\nList only the scopes the workflow needs, e.g. \"contents: read\", and grant write scopes only to the jobs that need them."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "workflow"
+                ],
+                "precision": "high",
+                "security-severity": "8.0"
+              }
+            },
+            {
+              "id": "workflow/missing-permissions",
+              "shortDescription": {
+                "text": "Token permissions not limited"
+              },
+              "fullDescription": {
+                "text": "Without a permissions block, jobs get the default GITHUB_TOKEN permissions from the repository or organization settings. On older repositories and many organizations that default is read and write for every scope, so any compromised step can push code, edit releases or approve pull requests."
+              },
+              "help": {
+                "text": "Without a permissions block, jobs get the default GITHUB_TOKEN permissions from the repository or organization settings. On older repositories and many organizations that default is read and write for every scope, so any compromised step can push code, edit releases or approve pull requests.\n\nHow to fix: Set \"permissions: contents: read\" at the top of the workflow, and grant extra scopes only to the jobs that need them.",
+                "markdown": "Without a permissions block, jobs get the default GITHUB\\_TOKEN permissions from the repository or organization settings. On older repositories and many organizations that default is read and write for every scope, so any compromised step can push code, edit releases or approve pull requests.\n\n## How to fix\n\nSet \"permissions: contents: read\" at the top of the workflow, and grant extra scopes only to the jobs that need them."
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "workflow"
+                ],
+                "precision": "high",
+                "security-severity": "5.5"
+              }
+            },
+            {
+              "id": "workflow/force-push",
+              "shortDescription": {
+                "text": "Force push"
+              },
+              "fullDescription": {
+                "text": "A force push replaces history on the remote instead of adding to it. A workflow that force-pushes holds a token that can rewrite branches or move tags, and anyone who compromises the workflow, through a malicious dependency, action or injected script, can use it to hide what they changed. Severity depends on the target: high for main, master, tags and mirrors, medium for other branches, low for deploy branches such as gh-pages."
+              },
+              "help": {
+                "text": "A force push replaces history on the remote instead of adding to it. A workflow that force-pushes holds a token that can rewrite branches or move tags, and anyone who compromises the workflow, through a malicious dependency, action or injected script, can use it to hide what they changed. Severity depends on the target: high for main, master, tags and mirrors, medium for other branches, low for deploy branches such as gh-pages.\n\nHow to fix: Push without force where possible, so a diverged branch fails instead of being overwritten. Block force pushes on the default branch and release tags with a ruleset, and allow them only where a workflow needs them, such as a gh-pages deploy branch.",
+                "markdown": "A force push replaces history on the remote instead of adding to it. A workflow that force-pushes holds a token that can rewrite branches or move tags, and anyone who compromises the workflow, through a malicious dependency, action or injected script, can use it to hide what they changed. Severity depends on the target: high for main, master, tags and mirrors, medium for other branches, low for deploy branches such as gh-pages.\n\n## How to fix\n\nPush without force where possible, so a diverged branch fails instead of being overwritten. Block force pushes on the default branch and release tags with a ruleset, and allow them only where a workflow needs them, such as a gh-pages deploy branch."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "workflow"
+                ],
+                "precision": "high",
+                "security-severity": "8.0"
+              }
+            }
+          ]
+        }
+      },
+      "originalUriBaseIds": {
+        "%SRCROOT%": {
+          "description": {
+            "text": "The repository root."
+          }
+        }
+      },
+      "columnKind": "utf16CodeUnits",
+      "invocations": [
+        {
+          "executionSuccessful": true
+        }
+      ],
+      "results": [
+        {
+          "ruleId": "workflow/untrusted-checkout",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "Job \"preview\" runs on pull_request_target and checks out ref \"${{ github.event.pull_request.head.sha }}\", so code from any fork can run with this repository's secrets and write token."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".github/workflows/pr-preview.yml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 14,
+                  "startColumn": 16,
+                  "endLine": 14,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "properties": {
+            "security-severity": "9.5"
+          }
+        },
+        {
+          "ruleId": "workflow/unpinned-action",
+          "ruleIndex": 2,
+          "level": "error",
+          "message": {
+            "text": "Third-party action \"example-org/deploy-preview\" is pinned to \"v2\", a tag or branch its owner can move."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".github/workflows/pr-preview.yml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 16,
+                  "startColumn": 15,
+                  "endLine": 16,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "properties": {
+            "security-severity": "8.0"
+          }
+        },
+        {
+          "ruleId": "workflow/write-all-permissions",
+          "ruleIndex": 3,
+          "level": "error",
+          "message": {
+            "text": "Workflow grants the GITHUB_TOKEN write access to every scope."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".github/workflows/release.yml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 7,
+                  "startColumn": 1,
+                  "endLine": 7,
+                  "endColumn": 23
+                }
+              }
+            }
+          ],
+          "properties": {
+            "security-severity": "8.0"
+          }
+        },
+        {
+          "ruleId": "workflow/unpinned-action",
+          "ruleIndex": 2,
+          "level": "error",
+          "message": {
+            "text": "Third-party action \"example-org/shared-workflows/.github/workflows/build.yml\" is pinned to \"main\", a tag or branch its owner can move."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".github/workflows/release.yml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 11,
+                  "startColumn": 11,
+                  "endLine": 11,
+                  "endColumn": 72
+                }
+              }
+            }
+          ],
+          "properties": {
+            "security-severity": "8.0"
+          }
+        },
+        {
+          "ruleId": "workflow/unpinned-action",
+          "ruleIndex": 2,
+          "level": "error",
+          "message": {
+            "text": "Container image \"docker://alpine:3.20\" is not pinned to a digest."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".github/workflows/release.yml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 17,
+                  "startColumn": 15,
+                  "endLine": 17,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "properties": {
+            "security-severity": "8.0"
+          }
+        },
+        {
+          "ruleId": "workflow/unpinned-action",
+          "ruleIndex": 2,
+          "level": "error",
+          "message": {
+            "text": "Third-party action \"example-org/create-release\" is pinned to \"v2\", a tag or branch its owner can move."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".github/workflows/release.yml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 18,
+                  "startColumn": 15,
+                  "endLine": 18,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "properties": {
+            "security-severity": "8.0"
+          }
+        },
+        {
+          "ruleId": "workflow/force-push",
+          "ruleIndex": 5,
+          "level": "error",
+          "message": {
+            "text": "Job \"publish\" force-pushes (--force) to tag \"v1\", which rewrites history on the remote instead of adding to it."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".github/workflows/release.yml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 22,
+                  "startColumn": 11,
+                  "endLine": 22,
+                  "endColumn": 37
+                }
+              }
+            }
+          ],
+          "properties": {
+            "security-severity": "8.0"
+          }
+        },
+        {
+          "ruleId": "workflow/pull-request-target",
+          "ruleIndex": 1,
+          "level": "warning",
+          "message": {
+            "text": "Workflow is triggered by pull_request_target, so it runs with secrets and a write token for pull requests from forks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".github/workflows/label.yml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 3,
+                  "startColumn": 5,
+                  "endLine": 3,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "properties": {
+            "security-severity": "5.5"
+          }
+        },
+        {
+          "ruleId": "workflow/missing-permissions",
+          "ruleIndex": 4,
+          "level": "warning",
+          "message": {
+            "text": "No top-level permissions block, and job \"preview\" doesn't set its own, so it gets the repository's default GITHUB_TOKEN permissions."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".github/workflows/pr-preview.yml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 9,
+                  "startColumn": 3,
+                  "endLine": 9,
+                  "endColumn": 11
+                }
+              }
+            }
+          ],
+          "properties": {
+            "security-severity": "5.5"
+          }
+        },
+        {
+          "ruleId": "workflow/force-push",
+          "ruleIndex": 5,
+          "level": "note",
+          "message": {
+            "text": "Job \"deploy\" force-pushes (--force) to branch \"gh-pages\". That's normal for publishing a site, but the job's token can rewrite that branch."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".github/workflows/docs.yml",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 16,
+                  "startColumn": 14,
+                  "endLine": 16,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "properties": {
+            "security-severity": "2.0"
+          }
+        }
+      ]
+    }
+  ]
+}

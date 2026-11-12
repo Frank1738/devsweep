@@ -1,7 +1,6 @@
 {
   "name": "devsweep",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "description": "Scan your dev setup and repos for the supply-chain and credential risks that infostealers exploit.",
   "license": "MIT",
   "keywords": [
@@ -11,43 +10,48 @@
     "secrets",
     "cli"
   ],
+  "homepage": "https://github.com/Frank1738/devsweep#readme",
+  "bugs": {
+    "url": "https://github.com/Frank1738/devsweep/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Frank1738/devsweep.git"
   },
   "type": "module",
   "bin": {
-    "devsweep": "./dist/bin.js"
+    "devsweep": "./dist/devsweep.mjs"
   },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.mjs"
     }
   },
   "files": [
-    "dist"
+    "dist/devsweep.mjs",
+    "dist/index.mjs",
+    "dist/**/*.d.ts"
   ],
   "engines": {
     "node": ">=22.12.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/bundle.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "format": "biome check --write .",
     "test": "node scripts/vitest.mjs run",
     "test:watch": "node scripts/vitest.mjs"
   },
-  "dependencies": {
-    "commander": "15.0.0",
-    "picocolors": "1.1.1",
-    "yaml": "2.9.1"
-  },
   "devDependencies": {
     "@biomejs/biome": "2.6.4",
     "@types/node": "24.19.2",
+    "commander": "15.0.0",
+    "picocolors": "1.1.1",
+    "rolldown": "1.2.16",
     "typescript": "7.0.2",
-    "vitest": "5.1.0"
+    "vitest": "5.1.0",
+    "yaml": "2.9.1"
   }
 }

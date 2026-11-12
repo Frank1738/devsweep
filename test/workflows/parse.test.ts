@@ -124,6 +124,19 @@ describe('parseWorkflow', () => {
     expect(wf.jobs[1]?.steps[0]?.uses?.value).toBe('example-org/checkout@v1');
   });
 
+  it('uses the first of two keys that read the same', () => {
+    // YAML only rejects a key written twice. An alias to a key is a different node, so it's allowed.
+    const wf = workflow(`
+      on: push
+      jobs:
+        a:
+          steps:
+            - &uses uses: example-org/first@v1
+              *uses : example-org/second@v1
+    `);
+    expect(wf.jobs[0]?.steps[0]?.uses?.value).toBe('example-org/first@v1');
+  });
+
   it('throws WorkflowParseError on invalid YAML', () => {
     expect(() => parseWorkflow('jobs: [unclosed', 'x.yml')).toThrow(WorkflowParseError);
   });

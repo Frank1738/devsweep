@@ -31,9 +31,15 @@ export const pullRequestTarget: Rule = {
 
 export const rules = [untrustedCheckout, pullRequestTarget] as const;
 
-/** Expressions and refs that point at the pull request's own code rather than the base branch. */
+/**
+ * Expressions and refs that point at the pull request's own code rather than the base branch.
+ * The merge commit counts too: it combines the base branch with the pull request's changes.
+ * Pull request refs count with or without "refs/": `git fetch origin pull/1/head` works too.
+ */
 const PR_HEAD_REF =
-  /github\.event\.pull_request\.head\.(?:sha|ref)\b|github\.head_ref\b|refs\/pull\//;
+  /github\.event\.pull_request\.(?:head\.(?:sha|ref)|merge_commit_sha)\b|github\.head_ref\b|refs\/pull\/|(?<![\w./-])pull\//;
+/** The repository the pull request comes from, which for a fork is the fork. */
+const PR_HEAD_REPO = /\bpull_request\.head\.repo\b/;
 const GIT_FETCH_OR_CHECKOUT = /\bgit\s+(?:fetch|checkout|switch|pull)\b/;
 const GH_PR_CHECKOUT = /\bgh\s+pr\s+checkout\b/;
 
@@ -43,9 +49,21 @@ export function analyze(workflow: Workflow): Finding[] {
 
   const checkouts = workflow.jobs.flatMap((job) =>
     job.steps.flatMap((step) => {
-      const ref = step.with.ref;
-      if (step.uses && isCheckoutAction(step.uses.value) && ref && PR_HEAD_REF.test(ref.value)) {
-        return [checkoutFinding(workflow, job.id, ref, `checks out ref "${ref.value}"`)];
+      const { ref, repository } = step.with;
+      if (step.uses && isCheckoutAction(step.uses.value)) {
+        if (ref && PR_HEAD_REF.test(ref.value)) {
+          return [checkoutFinding(workflow, job.id, ref, `checks out ref "${ref.value}"`)];
+        }
+        if (repository && PR_HEAD_REPO.test(repository.value)) {
+          return [
+            checkoutFinding(
+              workflow,
+              job.id,
+              repository,
+              `checks out repository "${repository.value}"`,
+            ),
+          ];
+        }
       }
       const fetch = step.run && scriptLines(step.run).find((line) => fetchesPullRequest(line.text));
       if (fetch) {
@@ -63,7 +81,6 @@ export function analyze(workflow: Workflow): Finding[] {
       message:
         'Workflow is triggered by pull_request_target, so it runs with secrets and a write token ' +
         'for pull requests from forks.',
-      remediation: pullRequestTarget.remediation,
     }),
   ];
 }
@@ -89,6 +106,5 @@ function checkoutFinding(
     message:
       `Job "${jobId}" runs on pull_request_target and ${what}, so code from any fork can run ` +
       "with this repository's secrets and write token.",
-    remediation: untrustedCheckout.remediation,
   });
 }

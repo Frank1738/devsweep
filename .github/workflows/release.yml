@@ -1,0 +1,78 @@
+name: Release
+
+# Pushing a signed version tag (git tag -s v0.1.0) stages that version on npm through trusted
+# publishing: no npm token is stored anywhere. Nothing is installable until a maintainer approves
+# the staged version with 2FA, on npmjs.com or with `npm stage approve`.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  verify-tag:
+    name: Tag is signed and verified
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require an annotated tag whose signature GitHub verified
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          object=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
+          read -r type sha <<<"$object"
+          if [ "$type" != "tag" ]; then
+            echo "::error::$TAG is a lightweight tag. Release from a signed tag: git tag -s $TAG"
+            exit 1
+          fi
+          verification=$(gh api "repos/$REPO/git/tags/$sha" --jq '(.verification.verified | tostring) + " " + .verification.reason')
+          read -r verified reason <<<"$verification"
+          if [ "$verified" != "true" ]; then
+            echo "::error::GitHub couldn't verify the signature on $TAG ($reason)."
+            exit 1
+          fi
+          echo "$TAG is signed, and GitHub verified the signature."
+
+  publish:
+    name: Stage on npm
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # trusted publishing and provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No dependency cache in a release job: a poisoned cache could end up in the package.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.21.0
+      - name: Check the tag matches package.json
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG doesn't match version $version in package.json."
+            exit 1
+          fi
+      - name: Check npm can stage releases (11.15.0 or later)
+        run: |
+          node -e '
+            const [major, minor] = process.argv[1].split(".").map(Number);
+            if (major < 11 || (major === 11 && minor < 15)) {
+              console.error(`::error::npm ${process.argv[1]} is too old for npm stage publish.`);
+              process.exit(1);
+            }' "$(npm --version)"
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Check the committed Action bundle matches the source
+        run: git diff --exit-code -- action/
+      - name: Stage the release on npm, with provenance
+        run: npm stage publish --provenance

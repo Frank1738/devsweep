@@ -1,8 +1,10 @@
 import type { Script } from './parse.js';
 
 /**
- * Just enough shell parsing to find commands in `run:` scripts. It doesn't handle quoting:
- * words are split on whitespace, which errs toward missing a command over inventing one.
+ * Just enough shell parsing to find commands in `run:` scripts. Words are split on whitespace,
+ * then quotes are removed from words that open and close them (`"main"` → `main`). A quoted
+ * string with spaces in it stays split and keeps its quotes, so `echo "git push"` never reads
+ * as a git command: this errs toward missing a command over inventing one.
  */
 
 export interface ScriptLine {
@@ -50,8 +52,24 @@ export function simpleCommands(line: string): string[][] {
     .replace(COMMENT, '')
     .replace(REDIRECTION, ' ')
     .split(SEPARATOR)
-    .map((segment) => segment.trim().split(/\s+/).filter(Boolean))
+    .map((segment) => segment.trim().split(/\s+/).filter(Boolean).map(unquote))
     .filter((words) => words.length > 0);
+}
+
+/**
+ * Removes shell quotes the way the shell would: `'main'`, `"main"` and `HEAD:"main"` all become
+ * `main` or `HEAD:main`. A word with a quote left open (`"git`) is returned unchanged, because its
+ * string continues in the next word.
+ */
+function unquote(word: string): string {
+  let result = '';
+  let open: string | undefined;
+  for (const char of word) {
+    if (open === undefined && (char === '"' || char === "'")) open = char;
+    else if (char === open) open = undefined;
+    else result += char;
+  }
+  return open === undefined ? result : word;
 }
 
 /** Words that can come before a command without changing which command runs. */

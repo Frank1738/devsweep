@@ -1,7 +1,7 @@
 /** Terminal escape sequences and helpers shared by the animations. */
 
-export const HIDE_CURSOR = '\u001b[?25l';
-export const SHOW_CURSOR = '\u001b[?25h';
+const HIDE_CURSOR = '\u001b[?25l';
+const SHOW_CURSOR = '\u001b[?25h';
 /** Returns to the start of the line and erases it. */
 export const CLEAR_LINE = '\r\u001b[2K';
 
@@ -27,6 +27,25 @@ export function hideCursor(write: (text: string) => void): () => void {
     process.removeListener('SIGINT', onInterrupt);
     show();
   };
+}
+
+/**
+ * Control characters other than tab. A terminal reads some of them as commands: ESC starts
+ * sequences that move the cursor or erase lines, and CR jumps back to the start of the line so
+ * the next text covers what was there.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: finding control characters is the point.
+const CONTROL = /[\u0000-\u0008\u000a-\u001f\u007f-\u009f]/g;
+
+/**
+ * Makes text from a scanned repository or from GitHub safe to print. A file name or file could
+ * hold escape sequences that erase or fake lines of the report, so each control character is
+ * shown as an escape like \x1b instead. Newlines are kept unless `oneLine` is set.
+ */
+export function printable(text: string, oneLine = false): string {
+  return text.replace(CONTROL, (char) =>
+    char === '\n' && !oneLine ? char : `\\x${char.charCodeAt(0).toString(16).padStart(2, '0')}`,
+  );
 }
 
 export function sleep(ms: number): Promise<void> {

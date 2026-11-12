@@ -1,1 +1,4 @@
 * text=auto eol=lf
+
+# Built by scripts/bundle.mjs; CI checks it matches the source.
+action/main.mjs linguist-generated=true

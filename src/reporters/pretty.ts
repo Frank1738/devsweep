@@ -2,6 +2,7 @@ import path from 'node:path';
 import pc from 'picocolors';
 import { rules } from '../checks/index.js';
 import { type Finding, type ScanResult, SEVERITIES, type Severity } from '../types.js';
+import { printable } from '../ui/terminal.js';
 import { markedSpan, type ReadLines } from './source.js';
 import { summarize } from './summary.js';
 
@@ -23,8 +24,15 @@ type Colors = ReturnType<typeof pc.createColors>;
 type Paint = (text: string) => string;
 
 interface Group {
-  file: string;
+  /** Undefined for findings about the repository's settings on GitHub. */
+  file: string | undefined;
   findings: Finding[];
+}
+
+/** Widths of the compact list's columns, in characters. */
+interface Columns {
+  line: number;
+  title: number;
 }
 
 const TITLES = new Map(rules.map((rule) => [rule.id, rule.title]));
@@ -32,7 +40,13 @@ const DOT = '●';
 const SEVERITY_WIDTH = Math.max(...SEVERITIES.map((s) => s.length));
 /** Upper bound for wrapped text, so details stay readable on very wide terminals. */
 const MAX_TEXT_WIDTH = 100;
+/** Lower bound, for terminals too narrow to fit details. Lines run over rather than vanish. */
+const MIN_TEXT_WIDTH = 20;
 
+/**
+ * The readable report. Findings, warnings and code excerpts hold text from the scanned files and
+ * from GitHub, so every piece of it goes through printable() before it reaches the terminal.
+ */
 export function formatPretty(result: ScanResult, options: PrettyOptions): string {
   const c = pc.createColors(options.color);
   const paint: Record<Severity, Paint> = {
@@ -43,28 +57,32 @@ export function formatPretty(result: ScanResult, options: PrettyOptions): string
   };
   const groups = groupByFile(result.findings);
   const width = options.width;
+  // The compact list aligns columns across every group, so the whole list reads as one table.
+  const columns = columnWidths(result.findings);
 
   const lines =
     options.showName === false
       ? [`  ${c.dim(`Results for ${options.target}`)}`, '']
       : ['', `  ${c.bold(c.cyan('devsweep'))}  ${c.dim(options.target)}`, ''];
   for (const group of groups) {
-    lines.push(`  ${formatPath(group.file, c)}`);
+    lines.push(
+      `  ${group.file === undefined ? c.bold('GitHub repository settings') : formatPath(group.file, c)}`,
+    );
     if (options.details) {
       lines.push('', ...group.findings.flatMap((f) => detailed(f, c, paint, options)));
     } else {
-      lines.push(...compact(group.findings, result.findings, c, paint, width), '');
+      lines.push(...compact(group.findings, columns, c, paint, width), '');
     }
   }
 
   const notices = [
     ...result.warnings.map(
       (w) =>
-        `  ${c.yellow('!')} ${truncate(`${w.file ? `${w.file}  ` : ''}${firstLine(w.message)}`, width, 4)}`,
+        `  ${c.yellow('!')} ${truncate(printable(`${w.file ? `${w.file}  ` : ''}${firstLine(w.message)}`, true), width, 4)}`,
     ),
     ...result.errors.map(
       (e) =>
-        `  ${c.red('×')} ${truncate(`check "${e.checkId}" failed: ${firstLine(e.message)}`, width, 4)}`,
+        `  ${c.red('×')} ${truncate(printable(`check "${e.checkId}" failed: ${firstLine(e.message)}`, true), width, 4)}`,
     ),
   ];
   if (notices.length > 0) lines.push(...notices, '');
@@ -76,24 +94,28 @@ export function formatPretty(result: ScanResult, options: PrettyOptions): string
 /** One line per finding: severity, line number, title and a short subject. */
 function compact(
   findings: Finding[],
-  all: Finding[],
+  columns: Columns,
   c: Colors,
   paint: Record<Severity, Paint>,
   width: number | undefined,
 ): string[] {
-  // Align columns across every group, so the whole list reads as one table.
-  const lineWidth = Math.max(...all.map((f) => String(f.line ?? '').length));
-  const titleWidth = Math.max(...all.map((f) => title(f).length));
-  const used = 4 + 2 + SEVERITY_WIDTH + 2 + lineWidth + 2 + titleWidth + 2;
+  const used = 4 + 2 + SEVERITY_WIDTH + 2 + columns.line + 2 + columns.title + 2;
 
   return findings.map((f) => {
     const severity = paint[f.severity](`${DOT} ${f.severity.padEnd(SEVERITY_WIDTH)}`);
-    const line = c.dim(String(f.line ?? '').padStart(lineWidth));
+    const line = c.dim(String(f.line ?? '').padStart(columns.line));
     const head = `    ${severity}  ${line}  ${title(f)}`;
     if (!f.subject) return head;
-    const gap = ' '.repeat(titleWidth - title(f).length + 2);
-    return `${head}${gap}${c.dim(truncate(f.subject, width, used))}`;
+    const gap = ' '.repeat(columns.title - title(f).length + 2);
+    return `${head}${gap}${c.dim(truncate(printable(f.subject, true), width, used))}`;
   });
+}
+
+function columnWidths(findings: readonly Finding[]): Columns {
+  return {
+    line: Math.max(...findings.map((f) => String(f.line ?? '').length)),
+    title: Math.max(...findings.map((f) => title(f).length)),
+  };
 }
 
 /** The explanation, a code excerpt pointing at the problem, and the fix. */
@@ -103,24 +125,27 @@ function detailed(
   paint: Record<Severity, Paint>,
   options: PrettyOptions,
 ): string[] {
-  const textWidth = Math.min(options.width ?? MAX_TEXT_WIDTH, MAX_TEXT_WIDTH) - 6;
+  const textWidth = Math.max(
+    Math.min(options.width ?? MAX_TEXT_WIDTH, MAX_TEXT_WIDTH) - 6,
+    MIN_TEXT_WIDTH,
+  );
   const indent = (text: string) => `      ${text}`;
   const lines = [
     `    ${paint[f.severity](`${DOT} ${f.severity}`)}  ${c.bold(title(f))}${f.line ? c.dim(`  line ${f.line}`) : ''}`,
-    ...wrap(f.message, textWidth).map(indent),
+    ...wrap(printable(f.message), textWidth).map(indent),
   ];
 
   const excerpt = codeExcerpt(f, options.readLines, textWidth, c, paint[f.severity]);
   if (excerpt.length > 0) lines.push('', ...excerpt.map(indent));
 
   if (f.remediation) {
-    const fix = wrap(`Fix: ${f.remediation}`, textWidth);
+    const fix = wrap(`Fix: ${printable(f.remediation)}`, textWidth);
     lines.push(
       '',
       ...fix.map((line, i) => indent(i === 0 ? line.replace(/^Fix:/, c.green('Fix:')) : line)),
     );
   }
-  lines.push(indent(c.dim(f.ruleId)), '');
+  lines.push(indent(c.dim(printable(f.ruleId, true))), '');
   return lines;
 }
 
@@ -132,17 +157,21 @@ function codeExcerpt(
   c: Colors,
   paint: Paint,
 ): string[] {
-  if (f.line === undefined || !readLines) return [];
+  if (f.file === undefined || f.line === undefined || !readLines) return [];
   const source = readLines(f.file);
-  const target = source?.[f.line - 1];
-  if (!source || target === undefined) return [];
+  const sourceLine = (n: number) => {
+    const text = source?.[n - 1];
+    return text === undefined ? undefined : printable(text, true);
+  };
+  const target = sourceLine(f.line);
+  if (target === undefined) return [];
 
   const gutter = String(f.line).length;
   const room = textWidth - gutter - 3;
   const show = (text: string) => (text.length > room ? `${text.slice(0, room - 1)}…` : text);
   const lines: string[] = [];
 
-  const above = source[f.line - 2];
+  const above = sourceLine(f.line - 1);
   if (above?.trim())
     lines.push(`${c.dim(`${String(f.line - 1).padStart(gutter)} │`)} ${c.dim(show(above))}`);
   lines.push(`${c.dim(`${String(f.line).padStart(gutter)} │`)} ${show(target)}`);
@@ -164,8 +193,16 @@ function summary(
   paint: Record<Severity, Paint>,
   details: boolean,
 ): string[] {
-  const skipped = result.warnings.length;
-  const extra = `${skipped > 0 ? `  ${c.yellow(`· ${skipped} skipped`)}` : ''}  ${c.dim(`· ${result.durationMs} ms`)}`;
+  const accepted = result.accepted.length;
+  const warned = result.warnings.length;
+  const extra = [
+    accepted > 0 ? c.dim(`· ${accepted} accepted`) : '',
+    warned > 0 ? c.yellow(`· ${warned} ${warned === 1 ? 'warning' : 'warnings'}`) : '',
+    c.dim(`· ${result.durationMs} ms`),
+  ]
+    .filter(Boolean)
+    .map((part) => `  ${part}`)
+    .join('');
   const failed = result.errors.length;
   const lines =
     failed > 0
@@ -191,7 +228,7 @@ function summary(
 
 /** Groups findings by file. Files with the most severe findings come first. */
 function groupByFile(findings: readonly Finding[]): Group[] {
-  const groups = new Map<string, Finding[]>();
+  const groups = new Map<string | undefined, Finding[]>();
   for (const finding of findings) {
     const group = groups.get(finding.file) ?? [];
     group.push(finding);
@@ -201,12 +238,13 @@ function groupByFile(findings: readonly Finding[]): Group[] {
 }
 
 function title(f: Finding): string {
-  return TITLES.get(f.ruleId) ?? f.ruleId;
+  return TITLES.get(f.ruleId) ?? printable(f.ruleId, true);
 }
 
 function formatPath(file: string, c: Colors): string {
-  const dir = path.posix.dirname(file);
-  return `${dir === '.' ? '' : c.dim(`${dir}/`)}${c.bold(path.posix.basename(file))}`;
+  const safe = printable(file, true);
+  const dir = path.posix.dirname(safe);
+  return `${dir === '.' ? '' : c.dim(`${dir}/`)}${c.bold(path.posix.basename(safe))}`;
 }
 
 function firstLine(text: string): string {
@@ -220,8 +258,12 @@ function truncate(text: string, width: number | undefined, used: number): string
   return text.length > room ? `${text.slice(0, room - 1)}…` : text;
 }
 
-/** Word-wraps `text` to `width` columns. Words longer than a line are split across lines. */
-export function wrap(text: string, width: number): string[] {
+/**
+ * Word-wraps `text` to `width` columns. Words longer than a line are split across lines. A width
+ * below 1 counts as 1, since splitting a word into zero-length pieces would never finish.
+ */
+export function wrap(text: string, columns: number): string[] {
+  const width = Math.max(columns, 1);
   const lines: string[] = [];
   let current = '';
   for (const word of text.split(/\s+/).filter(Boolean)) {

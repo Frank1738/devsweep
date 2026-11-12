@@ -43,6 +43,18 @@ describe('simpleCommands', () => {
       ['tee', 'log'],
     ]);
   });
+
+  it('removes quotes from words that open and close them', () => {
+    expect(simpleCommands(`git push "--force" origin 'main' HEAD:"refs/tags/$TAG" "a'b"`)).toEqual([
+      ['git', 'push', '--force', 'origin', 'main', 'HEAD:refs/tags/$TAG', "a'b"],
+    ]);
+  });
+
+  it('keeps the quotes on a quoted string that spans several words', () => {
+    expect(simpleCommands('echo "git push --force"')).toEqual([
+      ['echo', '"git', 'push', '--force"'],
+    ]);
+  });
 });
 
 describe('gitPushArgs', () => {

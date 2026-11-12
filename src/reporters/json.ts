@@ -7,8 +7,9 @@ export function formatJson(result: ScanResult, version: string): string {
     tool: { name: 'devsweep', version },
     root: result.root,
     durationMs: result.durationMs,
-    summary: summarize(result.findings),
+    summary: { ...summarize(result.findings), accepted: result.accepted.length },
     findings: result.findings,
+    accepted: result.accepted,
     warnings: result.warnings,
     errors: result.errors,
   };

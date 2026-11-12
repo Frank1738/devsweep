@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { rules } from '../src/checks/index.js';
+import { formatJson } from '../src/reporters/json.js';
 import { formatSarif, type SarifOptions, toSarif } from '../src/reporters/sarif.js';
 import { sourceReader } from '../src/reporters/source.js';
 import { scan } from '../src/scanner.js';
@@ -10,7 +11,15 @@ import { fixture } from './helpers.js';
 const VERSION = '0.0.0-test';
 
 function result(findings: Finding[], extra: Partial<ScanResult> = {}): ScanResult {
-  return { root: '/repo', findings, warnings: [], errors: [], durationMs: 5, ...extra };
+  return {
+    root: '/repo',
+    findings,
+    accepted: [],
+    warnings: [],
+    errors: [],
+    durationMs: 5,
+    ...extra,
+  };
 }
 
 const finding: Finding = {
@@ -34,7 +43,7 @@ function firstResult(input: ScanResult, options: Partial<SarifOptions> = {}) {
 
 describe('formatSarif', () => {
   it('matches the golden file for the vulnerable fixture', async () => {
-    const scanned = await scan({ root: fixture('vulnerable-repo') });
+    const scanned = await scan({ root: fixture('vulnerable-repo'), offline: true });
     const sarif = formatSarif(scanned, { version: VERSION, readLines: sourceReader(scanned.root) });
     await expect(sarif).toMatchFileSnapshot('./golden/vulnerable-repo.sarif');
   });
@@ -72,7 +81,7 @@ describe('formatSarif', () => {
   });
 
   it("sets each result's level from the finding, not the rule's default", async () => {
-    const scanned = await scan({ root: fixture('vulnerable-repo') });
+    const scanned = await scan({ root: fixture('vulnerable-repo'), offline: true });
     const run = toSarif(scanned, { version: VERSION }).runs[0];
     const forcePush = run.tool.driver.rules.find((rule) => rule.id === 'workflow/force-push');
     expect(forcePush?.defaultConfiguration.level).toBe('error');
@@ -85,8 +94,46 @@ describe('formatSarif', () => {
     ]);
   });
 
+  it('gives a rule the severity set for it in the config file, since GitHub reads it there', () => {
+    const run = toSarif(
+      result([{ ...finding, severity: 'low' }], {
+        severityOverrides: { 'workflow/unpinned-action': 'low' },
+      }),
+      { version: VERSION },
+    ).runs[0];
+    const levelAndScore = (id: string) => {
+      const rule = run.tool.driver.rules.find((r) => r.id === id);
+      return [rule?.defaultConfiguration.level, rule?.properties['security-severity']];
+    };
+    expect(levelAndScore('workflow/unpinned-action')).toEqual(['note', '2.0']);
+    expect(levelAndScore('workflow/write-all-permissions')).toEqual(['error', '8.0']);
+  });
+
+  it('carries severity overrides from the config file through a scan', async () => {
+    const scanned = await scan({ root: fixture('configured-repo'), offline: true });
+    const rule = toSarif(scanned, { version: VERSION }).runs[0].tool.driver.rules.find(
+      (r) => r.id === 'workflow/missing-permissions',
+    );
+    expect(rule?.defaultConfiguration.level).toBe('note');
+    expect(rule?.properties['security-severity']).toBe('2.0');
+  });
+
+  it('keeps severity overrides out of the JSON report, whose shape is public', async () => {
+    const scanned = await scan({ root: fixture('configured-repo'), offline: true });
+    expect(Object.keys(JSON.parse(formatJson(scanned, VERSION)))).toEqual([
+      'tool',
+      'root',
+      'durationMs',
+      'summary',
+      'findings',
+      'accepted',
+      'warnings',
+      'errors',
+    ]);
+  });
+
   it('points each ruleIndex at the rule with the same id', async () => {
-    const scanned = await scan({ root: fixture('vulnerable-repo') });
+    const scanned = await scan({ root: fixture('vulnerable-repo'), offline: true });
     const run = toSarif(scanned, { version: VERSION }).runs[0];
     expect(run.results).toHaveLength(10);
     for (const r of run.results) {
@@ -122,6 +169,34 @@ describe('formatSarif', () => {
     const { line: _, column: __, ...fileOnly } = finding;
     const sarif = firstResult(result([fileOnly]));
     expect(sarif.locations[0]?.physicalLocation.region).toBeUndefined();
+  });
+
+  it('fingerprints each settings finding, so ones sharing a rule stay separate alerts', () => {
+    const settings = (subject: string): Finding => ({
+      ruleId: 'repo/force-push-detected',
+      severity: 'high',
+      message: 'Someone force-pushed.',
+      subject,
+    });
+    const fingerprints = (findings: Finding[]) =>
+      toSarif(result(findings), { version: VERSION }).runs[0].results.map(
+        (r) => r.partialFingerprints?.primaryLocationLineHash,
+      );
+
+    const [first, second] = fingerprints([
+      settings('branch main aaaaaaa..bbbbbbb'),
+      settings('branch main ccccccc..ddddddd'),
+    ]);
+    expect(first).toMatch(/^[0-9a-f]{16}:1$/);
+    expect(second).not.toBe(first);
+    // The same problem keeps its fingerprint in the next run, even at a different severity.
+    expect(
+      fingerprints([{ ...settings('branch main aaaaaaa..bbbbbbb'), severity: 'low' }]),
+    ).toEqual([first]);
+  });
+
+  it('leaves fingerprints for findings in files to upload-sarif', () => {
+    expect(firstResult(result([finding])).partialFingerprints).toBeUndefined();
   });
 
   it('writes paths from the repository root, percent-encoded', () => {

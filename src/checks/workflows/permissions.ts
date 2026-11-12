@@ -74,7 +74,6 @@ export function analyze(workflow: Workflow): Finding[] {
           message:
             `No top-level permissions block, and ${jobs} the repository's default GITHUB_TOKEN ` +
             'permissions.',
-          remediation: missingPermissions.remediation,
         }),
       );
     }

@@ -1,0 +1,24 @@
+{
+  "accept": [
+    {
+      "rule": "workflow/pull-request-target",
+      "file": ".github/workflows/label.yml",
+      "reason": "Only adds labels; it never checks out or runs pull request code."
+    },
+    {
+      "rule": "workflow/unpinned-action",
+      "file": ".github/workflows/ci.yml",
+      "subject": "example-org/setup-tool@v3",
+      "reason": "Our own action, released from a protected tag."
+    },
+    {
+      "rule": "workflow/force-push",
+      "file": ".github/workflows/pages.yml",
+      "subject": "branch gh-pages",
+      "reason": "Publishing the docs site."
+    }
+  ],
+  "rules": {
+    "workflow/missing-permissions": { "severity": "low" }
+  }
+}

@@ -153,6 +153,54 @@
                 "precision": "high",
                 "security-severity": "8.0"
               }
+            },
+            {
+              "id": "repo/force-push-allowed",
+              "shortDescription": {
+                "text": "Force pushes allowed"
+              },
+              "fullDescription": {
+                "text": "Without a ruleset or branch protection that blocks it, anyone with write access, or a stolen token with write access, can force-push the default branch or move a release tag. That rewrites history and can point a trusted tag at malicious code, which is how the tj-actions/changed-files attack in March 2025 reached thousands of repositories."
+              },
+              "help": {
+                "text": "Without a ruleset or branch protection that blocks it, anyone with write access, or a stolen token with write access, can force-push the default branch or move a release tag. That rewrites history and can point a trusted tag at malicious code, which is how the tj-actions/changed-files attack in March 2025 reached thousands of repositories.\n\nHow to fix: In Settings → Rules → Rulesets, add a branch ruleset for the default branch with \"Block force pushes\" and \"Restrict deletions\", and a tag ruleset for release tags (e.g. refs/tags/v*) with \"Restrict updates\" and \"Restrict deletions\".",
+                "markdown": "Without a ruleset or branch protection that blocks it, anyone with write access, or a stolen token with write access, can force-push the default branch or move a release tag. That rewrites history and can point a trusted tag at malicious code, which is how the tj-actions/changed-files attack in March 2025 reached thousands of repositories.\n\n## How to fix\n\nIn Settings → Rules → Rulesets, add a branch ruleset for the default branch with \"Block force pushes\" and \"Restrict deletions\", and a tag ruleset for release tags (e.g. refs/tags/v\\*) with \"Restrict updates\" and \"Restrict deletions\"."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "repo"
+                ],
+                "precision": "high",
+                "security-severity": "8.0"
+              }
+            },
+            {
+              "id": "repo/force-push-detected",
+              "shortDescription": {
+                "text": "Recent force push"
+              },
+              "fullDescription": {
+                "text": "Someone force-pushed the default branch in the last 90 days, replacing part of its history. That can be routine cleanup, but it is also how a stolen token hides what it changed. GitHub keeps a record of force pushes for branches only, so moved tags cannot be detected this way."
+              },
+              "help": {
+                "text": "Someone force-pushed the default branch in the last 90 days, replacing part of its history. That can be routine cleanup, but it is also how a stolen token hides what it changed. GitHub keeps a record of force pushes for branches only, so moved tags cannot be detected this way.\n\nHow to fix: Open the repository's Activity view on GitHub, compare the commits before and after the push, and confirm who made it and why. Then accept the finding in devsweep.config.json with that reason, and block future force pushes with a ruleset.",
+                "markdown": "Someone force-pushed the default branch in the last 90 days, replacing part of its history. That can be routine cleanup, but it is also how a stolen token hides what it changed. GitHub keeps a record of force pushes for branches only, so moved tags cannot be detected this way.\n\n## How to fix\n\nOpen the repository's Activity view on GitHub, compare the commits before and after the push, and confirm who made it and why. Then accept the finding in devsweep.config.json with that reason, and block future force pushes with a ruleset."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "repo"
+                ],
+                "precision": "high",
+                "security-severity": "8.0"
+              }
             }
           ]
         }

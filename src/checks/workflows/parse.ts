@@ -58,6 +58,13 @@ interface Entry {
   value: unknown;
 }
 
+interface Entries {
+  /** Every entry with a scalar key, in document order. */
+  list: readonly Entry[];
+  /** The first entry for each key. */
+  byKey: ReadonlyMap<string, Entry>;
+}
+
 /**
  * Parses a GitHub Actions workflow into the parts devsweep's rules need, keeping line numbers.
  * Returns undefined when the YAML is valid but isn't shaped like a workflow.
@@ -84,6 +91,12 @@ export function parseWorkflow(source: string, file: string): Workflow | undefine
 }
 
 class Reader {
+  /**
+   * Each map's entries, built once: building them resolves aliases, and the same map is read
+   * once per key looked up. Keyed by node, so a map reached through an alias shares its entry.
+   */
+  private readonly cache = new WeakMap<YAMLMap, Entries>();
+
   constructor(
     private readonly doc: Document,
     private readonly lineCounter: LineCounter,
@@ -155,16 +168,29 @@ class Reader {
     });
   }
 
-  private entries(map: YAMLMap): Entry[] {
-    return map.items.flatMap((pair) => {
-      const keyNode = this.deref(pair.key);
-      if (!isScalar(keyNode)) return [];
-      return [{ key: String(keyNode.value), keyNode, value: this.deref(pair.value) }];
-    });
+  private entries(map: YAMLMap): readonly Entry[] {
+    return this.cached(map).list;
   }
 
   private field(map: YAMLMap, key: string): Entry | undefined {
-    return this.entries(map).find((e) => e.key === key);
+    return this.cached(map).byKey.get(key);
+  }
+
+  private cached(map: YAMLMap): Entries {
+    let entries = this.cache.get(map);
+    if (!entries) {
+      const list = map.items.flatMap((pair) => {
+        const keyNode = this.deref(pair.key);
+        if (!isScalar(keyNode)) return [];
+        return [{ key: String(keyNode.value), keyNode, value: this.deref(pair.value) }];
+      });
+      const byKey = new Map<string, Entry>();
+      // A key can repeat, e.g. `1` and `"1"` are different keys to YAML. Keep the first.
+      for (const entry of list) if (!byKey.has(entry.key)) byKey.set(entry.key, entry);
+      entries = { list, byKey };
+      this.cache.set(map, entries);
+    }
+    return entries;
   }
 
   private script(node: unknown): Script | undefined {

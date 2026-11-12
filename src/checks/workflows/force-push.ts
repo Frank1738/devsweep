@@ -2,6 +2,12 @@ import { createFinding, type Finding, type Rule, type Severity } from '../../typ
 import type { Step, Workflow } from './parse.js';
 import { gitPushArgs, scriptLines, simpleCommands } from './shell.js';
 
+/** How the rule's advice and a finding's both start. Each ends by saying where to allow them. */
+const PUSH_WITHOUT_FORCE =
+  'Push without force where possible, so a diverged branch fails instead of being ' +
+  'overwritten. Block force pushes on the default branch and release tags with a ruleset, ' +
+  'and allow them only where';
+
 export const forcePush: Rule = {
   id: 'workflow/force-push',
   title: 'Force push',
@@ -12,10 +18,7 @@ export const forcePush: Rule = {
     'compromises the workflow, through a malicious dependency, action or injected script, can ' +
     'use it to hide what they changed. Severity depends on the target: high for main, master, ' +
     'tags and mirrors, medium for other branches, low for deploy branches such as gh-pages.',
-  remediation:
-    'Push without force where possible, so a diverged branch fails instead of being ' +
-    'overwritten. Block force pushes on the default branch and release tags with a ruleset, ' +
-    'and allow them only where a workflow needs them, such as a gh-pages deploy branch.',
+  remediation: `${PUSH_WITHOUT_FORCE} a workflow needs them, such as a gh-pages deploy branch.`,
 };
 
 export const rules = [forcePush] as const;
@@ -26,6 +29,8 @@ interface ForcePush {
   /** Branches or tags being force-pushed. Empty means the checked-out branch. */
   targets: string[];
   allTags: boolean;
+  /** `--all` or `--branches`: every local branch, which includes the default branch. */
+  allBranches: boolean;
   mirror: boolean;
 }
 
@@ -66,6 +71,7 @@ export function analyze(workflow: Workflow): Finding[] {
 function fromGitPush(args: readonly string[]): ForcePush | undefined {
   let how: string | undefined;
   let allTags = false;
+  let allBranches = false;
   let mirror = false;
   const positionals: string[] = [];
 
@@ -81,6 +87,8 @@ function fromGitPush(args: readonly string[]): ForcePush | undefined {
       how ??= arg;
     } else if (arg === '--tags') {
       allTags = true;
+    } else if (arg === '--all' || arg === '--branches') {
+      allBranches = true;
     } else if (PUSH_OPTIONS_WITH_VALUE.has(arg)) {
       i++;
     } else if (!arg.startsWith('-')) {
@@ -97,6 +105,7 @@ function fromGitPush(args: readonly string[]): ForcePush | undefined {
     how: how ?? 'a "+" refspec',
     targets: (how === undefined ? plusRefspecs : refspecs).map(destination),
     allTags: allTags && how !== undefined,
+    allBranches: allBranches && how !== undefined,
     mirror,
   };
 }
@@ -125,6 +134,7 @@ function fromActionInputs(step: Step): { push: ForcePush; at: { line: number; co
         how: `${key}: ${input.value}`,
         targets,
         allTags: inputs.some(([name, value]) => name === 'tags' && TRUE.test(value.value)),
+        allBranches: false,
         mirror: false,
       },
       at: input,
@@ -156,7 +166,12 @@ function isDeployBranch(ref: string): boolean {
 }
 
 function severityOf(push: ForcePush): Severity {
-  if (push.mirror || push.allTags || push.targets.some((t) => isTag(t) || isDefaultBranch(t))) {
+  if (
+    push.mirror ||
+    push.allBranches ||
+    push.allTags ||
+    push.targets.some((t) => isTag(t) || isDefaultBranch(t))
+  ) {
     return 'high';
   }
   if (push.targets.length > 0 && push.targets.every(isDeployBranch)) return 'low';
@@ -169,6 +184,7 @@ function describeTargets(push: ForcePush, quote: boolean): string {
   const q = quote ? '"' : '';
   const targets = push.targets.map((t) => `${isTag(t) ? 'tag' : 'branch'} ${q}${shortName(t)}${q}`);
   if (push.allTags) targets.unshift('all tags');
+  if (push.allBranches) targets.unshift('every branch');
   if (targets.length > 0) return targets.join(', ');
   return quote ? 'the checked-out branch' : 'checked-out branch';
 }
@@ -195,10 +211,7 @@ function finding(
         }
       : {
           message: `${action}, which rewrites history on the remote instead of adding to it.`,
-          remediation:
-            'Push without force where possible, so a diverged branch fails instead of being ' +
-            'overwritten. Block force pushes on the default branch and release tags with a ' +
-            'ruleset, and allow them only where this workflow needs them.',
+          remediation: `${PUSH_WITHOUT_FORCE} this workflow needs them.`,
         }),
   });
 }

@@ -23,6 +23,48 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
 
+  bundle:
+    name: Action bundle matches the source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Fail if the committed bundle differs from a fresh build
+        run: git diff --exit-code -- action/
+
+  self-scan:
+    name: devsweep scans this repository
+    runs-on: ubuntu-latest
+    # The only job that can write code scanning alerts.
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the local action
+        id: devsweep
+        uses: ./
+        env:
+          # Lets devsweep read this repository's rulesets and force-push history.
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Upload the results to code scanning
+        # Runs even when devsweep fails the step, so findings still reach the Security tab.
+        # Pull requests from forks get a read-only token, which can't upload.
+        if: ${{ !cancelled() && steps.devsweep.outputs.sarif-file != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ steps.devsweep.outputs.sarif-file }}
+          category: devsweep
+
   test:
     name: test (Node ${{ matrix.node }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -43,4 +85,5 @@ jobs:
       - run: npm test
       - run: npm run build
       - name: Scan this repository
-        run: node dist/bin.js scan .
+        # The bundled command, exactly as npm users get it.
+        run: node dist/devsweep.mjs scan .

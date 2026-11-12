@@ -27,12 +27,17 @@ describe('workflow/force-push in run steps', () => {
     ['git push --force origin refs/tags/v1.2.3', 'high', 'tag "v1.2.3"'],
     ['git push --force --tags', 'high', 'all tags'],
     ['git push --mirror https://example.com/backup.git', 'high', 'every branch and tag'],
+    ['git push --force --all', 'high', 'every branch'],
+    ['git push -f origin --branches', 'high', 'every branch'],
     ['git push origin +main', 'high', 'branch "main"'],
     ['git push --force', 'medium', 'the checked-out branch'],
     ['git push --force-with-lease origin feature/login', 'medium', 'branch "feature/login"'],
     ['git push -fu origin HEAD:refs/heads/release-notes', 'medium', 'branch "release-notes"'],
     ['git push --force origin HEAD:gh-pages', 'low', 'branch "gh-pages"'],
     ['git push origin main +gh-pages', 'low', 'branch "gh-pages"'],
+    ["git push origin 'main' -f", 'high', 'branch "main"'],
+    ['git push "--force" origin "refs/tags/$TAG"', 'high', 'tag "$TAG"'],
+    ['git push origin "+HEAD:main"', 'high', 'branch "main"'],
   ])('rates "%s" as %s', (command, severity, target) => {
     const findings = run(command);
     expect(findings).toEqual([
@@ -44,6 +49,7 @@ describe('workflow/force-push in run steps', () => {
   it.each([
     'git push origin main',
     'git push --tags',
+    'git push --all origin',
     'git push --force-if-includes origin main',
     'git push -o ci.skip origin main',
     'git tag -f v1',

@@ -2,16 +2,26 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Command, CommanderError, Option } from 'commander';
 import pc from 'picocolors';
+import { ConfigError } from './config.js';
+import { errorMessage } from './errors.js';
+import {
+  DEFAULT_FAIL_ON,
+  EXIT_OK,
+  EXIT_TOOL_ERROR,
+  exitCodeFor,
+  FAIL_ON,
+  type FailOn,
+} from './exit-code.js';
 import { findRepository } from './git.js';
 import { formatJson } from './reporters/json.js';
 import { formatPretty } from './reporters/pretty.js';
 import { formatSarif } from './reporters/sarif.js';
 import { type ReadLines, sourceReader } from './reporters/source.js';
 import { ScanTargetError, scan } from './scanner.js';
-import type { ScanResult } from './types.js';
+import type { Env, ScanResult } from './types.js';
 import { bannerFits, playBanner, renderBanner } from './ui/banner.js';
 import { startSweep } from './ui/sweep.js';
-import { sleep } from './ui/terminal.js';
+import { printable, sleep } from './ui/terminal.js';
 import { VERSION } from './version.js';
 
 export interface Io {
@@ -22,18 +32,21 @@ export interface Io {
   interactive: boolean;
   /** Terminal width in columns, when known. */
   width?: number | undefined;
+  /** Where tokens are read from. Defaults to process.env. */
+  env?: Env | undefined;
+  /** For GitHub API calls. Defaults to the global fetch. */
+  fetch?: typeof fetch | undefined;
 }
 
-/** Exit codes. Findings don't affect the exit code yet; `--fail-on` arrives in Phase 2. */
-export const EXIT_OK = 0;
-export const EXIT_TOOL_ERROR = 2;
-
 interface ScanFlags {
+  /** Always set: commander fills in the default and rejects anything else. */
+  failOn: FailOn;
   json?: boolean;
   sarif?: boolean;
   /** Where to save the --json or --sarif report. */
   output?: string;
   details?: boolean;
+  offline?: boolean;
   /** False when --no-color is passed. */
   color?: boolean;
 }
@@ -63,6 +76,14 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
     .description('scan a repository for risky settings (the default command)')
     .argument('[path]', 'directory to scan', '.')
     .option('-d, --details', 'explain each finding and how to fix it')
+    .addOption(
+      new Option(
+        '--fail-on <severity>',
+        'exit with code 1 when a finding is at or above this severity',
+      )
+        .choices(FAIL_ON)
+        .default(DEFAULT_FAIL_ON),
+    )
     .option('--json', 'print results as JSON')
     .addOption(
       new Option('--sarif', 'print results as SARIF 2.1.0, for GitHub code scanning').conflicts(
@@ -73,6 +94,7 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
       '-o, --output <file>',
       'save the --json or --sarif report to a file, and show the readable report',
     )
+    .option('--offline', 'skip the checks that call the GitHub API')
     .option('--no-color', 'turn off colors');
 
   scanCommand.action(async (target: string, flags: ScanFlags) => {
@@ -89,7 +111,9 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
 
     // Start scanning right away, so the work overlaps the animations.
     let scanned = false;
-    const scanning = settle(scan({ root: target })).finally(() => {
+    const scanning = settle(
+      scan({ root: target, offline: flags.offline ?? false, env: io.env, fetch: io.fetch }),
+    ).finally(() => {
       scanned = true;
     });
     if (banner) await playBanner(io.stdout, { color, version: VERSION, width: io.width });
@@ -102,8 +126,9 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
     await stopSweep?.();
 
     if (!outcome.ok) {
-      if (!(outcome.error instanceof ScanTargetError)) throw outcome.error;
-      io.stderr(`devsweep: ${outcome.error.message}\n`);
+      if (!isSetupError(outcome.error)) throw outcome.error;
+      // A config error can quote the scanned repository's config file.
+      io.stderr(`devsweep: ${printable(outcome.error.message)}\n`);
       exitCode = EXIT_TOOL_ERROR;
       return;
     }
@@ -140,13 +165,15 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
       if (animate) await reveal(io, report);
       else io.stdout(report);
     }
-    if (result.errors.length > 0) exitCode = EXIT_TOOL_ERROR;
+    exitCode = exitCodeFor(result, flags.failOn);
   });
 
   try {
     await program.parseAsync(argv, { from: 'user' });
   } catch (error) {
-    if (error instanceof CommanderError) return error.exitCode;
+    // Help and --version exit 0. Usage mistakes get 2 rather than commander's 1, so that 1
+    // always means "findings".
+    if (error instanceof CommanderError) return error.exitCode === 0 ? EXIT_OK : EXIT_TOOL_ERROR;
     throw error;
   }
   return exitCode;
@@ -180,6 +207,11 @@ async function reveal(io: Io, report: string, durationMs = 180): Promise<void> {
   }
 }
 
+/** Problems with what the user asked for, shown as one line instead of a stack trace. */
+function isSetupError(error: unknown): error is Error {
+  return error instanceof ScanTargetError || error instanceof ConfigError;
+}
+
 function machineFormat(flags: ScanFlags): MachineFormat | undefined {
   if (flags.sarif) return 'sarif';
   if (flags.json) return 'json';
@@ -208,7 +240,6 @@ async function saveReport(file: string, text: string): Promise<string | undefine
     await writeFile(file, text, 'utf8');
     return undefined;
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    return `Couldn't save the report to ${file}: ${detail}`;
+    return `Couldn't save the report to ${file}: ${errorMessage(error)}`;
   }
 }

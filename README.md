@@ -57,3 +57,7 @@ npm run typecheck   # tsc
 ```
 
 `test/fixtures/vulnerable-repo` is a sample repository with one of each problem planted in it.
+
+## License
+
+[MIT](LICENSE)

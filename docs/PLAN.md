@@ -4,12 +4,12 @@ devsweep is a CLI and GitHub Action that scans a developer's machine and repos f
 
 It is built in four phases. Each phase has one job and ends with something that works.
 
-| Phase | Job                                  | Status                          |
-| ----- | ------------------------------------ | ------------------------------- |
-| 1     | Core CLI and workflow scanning       | Built; CI not yet run on GitHub |
-| 2     | GitHub integration and first release | Not started                     |
-| 3     | Dependency and secret scanning       | Not started                     |
-| 4     | Results and launch                   | Not started                     |
+| Phase | Job                                  | Status                               |
+| ----- | ------------------------------------ | ------------------------------------ |
+| 1     | Core CLI and workflow scanning       | Done (CI green on Linux and Windows) |
+| 2     | GitHub integration and first release | Not started                          |
+| 3     | Dependency and secret scanning       | Not started                          |
+| 4     | Results and launch                   | Not started                          |
 
 ---
 
@@ -43,7 +43,8 @@ It is built in four phases. Each phase has one job and ends with something that 
 - [ ] A config file for accepting reviewed findings
 - [ ] GitHub Action wrapper
 - [ ] devsweep scans its own repo in CI
-- [ ] Choose a license, then publish 0.1.0 to npm with provenance
+- [x] License: MIT
+- [ ] Publish 0.1.0 to npm with provenance
 - [ ] Decide whether to bundle runtime dependencies so the package installs with zero dependencies
 - [ ] Repository checks through the GitHub API. These are devsweep's first network checks: they run only when a GitHub token is available, and `--offline` skips them.
   - [ ] `repo/force-push-allowed`: the default branch or release tags aren't protected against force pushes (read from rulesets). Reading classic branch protection needs admin access, so without it devsweep reports "couldn't check" rather than guessing.

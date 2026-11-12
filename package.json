@@ -3,6 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "description": "Scan your dev setup and repos for the supply-chain and credential risks that infostealers exploit.",
+  "license": "MIT",
   "keywords": [
     "security",
     "supply-chain",

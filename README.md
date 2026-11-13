@@ -6,8 +6,6 @@ Scan your dev setup and repos for the supply-chain and credential risks that inf
 
 ![A terminal running npx @frank1738/devsweep --offline in a sample repository. The DEVSWEEP banner sweeps in, then 10 findings are listed by file: 1 critical, 6 high, 2 medium and 1 low.](assets/demo.svg)
 
-<sub>devsweep scanning <code>test/fixtures/vulnerable-repo</code>, a sample repository in this project with problems planted on purpose.</sub>
-
 **Why care?** Attackers often skip your code and go after something your project trusts: a GitHub Action you use, your release workflow, or a maintainer's access token. That's a _supply-chain attack_. One common way tokens get stolen is _infostealers_: malware that copies saved passwords and tokens off developers' computers. devsweep finds the settings that would let a stolen token or a hijacked action do real damage, and tells you how to fix each one.
 
 Today it checks:

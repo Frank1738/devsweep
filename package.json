@@ -1,5 +1,5 @@
 {
-  "name": "devsweep",
+  "name": "@frank1738/devsweep",
   "version": "0.1.0",
   "description": "Scan your dev setup and repos for the supply-chain and credential risks that infostealers exploit.",
   "license": "MIT",
@@ -20,7 +20,7 @@
   },
   "type": "module",
   "bin": {
-    "devsweep": "./dist/devsweep.mjs"
+    "devsweep": "dist/devsweep.mjs"
   },
   "exports": {
     ".": {
@@ -35,6 +35,9 @@
   ],
   "engines": {
     "node": ">=22.12.0"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/bundle.mjs",

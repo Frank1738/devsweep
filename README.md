@@ -9,14 +9,16 @@ Scan your dev setup and repos for the supply-chain and credential risks that inf
 Requires Node 22.12 or later.
 
 ```sh
-npx devsweep [path]                  # scan a folder (default: the current one)
-npx devsweep [path] --details        # explain each finding, with the code and the fix
-npx devsweep [path] --json           # machine-readable output
-npx devsweep [path] --sarif          # SARIF 2.1.0, the format GitHub's Security tab reads
-npx devsweep [path] --sarif -o FILE  # save the report to FILE, and show the readable one
-npx devsweep [path] --fail-on high   # fail only on high or critical findings
-npx devsweep [path] --offline        # skip the checks that call the GitHub API
+npx @frank1738/devsweep [path]                  # scan a folder (default: the current one)
+npx @frank1738/devsweep [path] --details        # explain each finding, with the code and the fix
+npx @frank1738/devsweep [path] --json           # machine-readable output
+npx @frank1738/devsweep [path] --sarif          # SARIF 2.1.0, the format GitHub's Security tab reads
+npx @frank1738/devsweep [path] --sarif -o FILE  # save the report to FILE, and show the readable one
+npx @frank1738/devsweep [path] --fail-on high   # fail only on high or critical findings
+npx @frank1738/devsweep [path] --offline        # skip the checks that call the GitHub API
 ```
+
+To type less, install it once with `npm install -g @frank1738/devsweep`, then run `devsweep` with the same options.
 
 The npm package has no dependencies: devsweep and the three libraries it uses are bundled into one readable file. Every release is published from GitHub Actions with [provenance](https://docs.npmjs.com/generating-provenance-statements), so `npm audit signatures` can confirm it was built from this repository.
 

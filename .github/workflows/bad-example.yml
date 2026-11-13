@@ -1,0 +1,15 @@
+# Test only: a deliberately unsafe workflow, to prove devsweep flags it on a pull request.
+# Never merge this. pull_request_target runs from main's copy of a workflow, so this file
+# doesn't run while it only exists on this branch.
+name: Bad example (do not merge)
+
+on: pull_request_target
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm test

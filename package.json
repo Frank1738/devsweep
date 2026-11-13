@@ -1,13 +1,16 @@
 {
   "name": "@frank1738/devsweep",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Scan your dev setup and repos for the supply-chain and credential risks that infostealers exploit.",
   "license": "MIT",
   "keywords": [
     "security",
     "supply-chain",
+    "supply-chain-security",
     "github-actions",
-    "secrets",
+    "github-actions-security",
+    "sarif",
+    "code-scanning",
     "cli"
   ],
   "homepage": "https://github.com/Frank1738/devsweep#readme",

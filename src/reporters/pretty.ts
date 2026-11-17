@@ -1,8 +1,16 @@
 import path from 'node:path';
 import pc from 'picocolors';
 import { rules } from '../checks/index.js';
-import { type Finding, type ScanResult, SEVERITIES, type Severity } from '../types.js';
+import { count, list, plural } from '../format.js';
+import {
+  type Finding,
+  type ScanAllResult,
+  type ScanResult,
+  SEVERITIES,
+  type Severity,
+} from '../types.js';
 import { printable } from '../ui/terminal.js';
+import { PROJECT_MARKERS } from '../walk.js';
 import { markedSpan, type ReadLines } from './source.js';
 import { summarize } from './summary.js';
 
@@ -36,6 +44,11 @@ interface Columns {
 }
 
 const TITLES = new Map(rules.map((rule) => [rule.id, rule.title]));
+/** Rules whose findings may point at malicious code: their lines are never printed. */
+const HIDES_SOURCE = new Set(rules.filter((rule) => rule.hidesSource).map((rule) => rule.id));
+/** Shown in place of the code excerpt for those rules. */
+export const SOURCE_HIDDEN_NOTE =
+  "The line isn't shown here, since it may hold malicious code. Open the file in a plain text editor to read it.";
 const DOT = '●';
 const SEVERITY_WIDTH = Math.max(...SEVERITIES.map((s) => s.length));
 /** Upper bound for wrapped text, so details stay readable on very wide terminals. */
@@ -49,22 +62,115 @@ const MIN_TEXT_WIDTH = 20;
  */
 export function formatPretty(result: ScanResult, options: PrettyOptions): string {
   const c = pc.createColors(options.color);
-  const paint: Record<Severity, Paint> = {
+  const paint = painter(c);
+  const lines = header(`Results for ${options.target}`, options.target, c, options.showName);
+  // The compact list aligns columns across every group, so the whole list reads as one table.
+  lines.push(...resultBody(result, columnWidths(result.findings), c, paint, options));
+  lines.push(...summary(result, c, paint, options.details ?? false, options.width));
+  return `${lines.join('\n')}\n`;
+}
+
+export interface PrettyAllOptions extends Omit<PrettyOptions, 'readLines'> {
+  /** Reads a project's file lines, for code excerpts in details mode. Given the project's root. */
+  readerFor?: ((root: string) => ReadLines) | undefined;
+}
+
+/** Shown once at the top of every `--all` report. */
+export const ALL_OFFLINE_NOTE =
+  'Network checks are off with --all, as if --offline were passed: checking the GitHub settings of dozens of repositories would hit GitHub’s rate limit. Scan one repository without --all to include them.';
+
+/** How many unreadable folders the readable report names. JSON lists them all. */
+const UNREADABLE_SHOWN = 5;
+
+/**
+ * The readable `--all` report: findings grouped by project, then by file, and one summary for
+ * everything. Projects with nothing to report are counted but not listed.
+ */
+export function formatPrettyAll(all: ScanAllResult, options: PrettyAllOptions): string {
+  const c = pc.createColors(options.color);
+  const paint = painter(c);
+  const width = options.width;
+  const inner = { ...options, width: width === undefined ? undefined : width - 2 };
+  const lines = header(
+    `Results for every project under ${options.target}`,
+    `${options.target}  · every project`,
+    c,
+    options.showName,
+  );
+  lines.push(...wrap(ALL_OFFLINE_NOTE, textWidthAfter(2, width)).map((l) => c.dim(`  ${l}`)), '');
+
+  const shown = all.projects.filter(
+    ({ result }) => result.findings.length + result.warnings.length + result.errors.length > 0,
+  );
+  // One table across every project, so the columns line up all the way down.
+  const columns = columnWidths(shown.flatMap(({ result }) => result.findings));
+  for (const { path: projectPath, result } of shown) {
+    const name = projectPath === '.' ? '. (the folder itself)' : printable(projectPath, true);
+    lines.push(`  ${c.bold(c.cyan(name))}`);
+    const body = resultBody(result, columns, c, paint, {
+      ...inner,
+      readLines: options.readerFor?.(result.root),
+    });
+    lines.push(...body.map((line) => (line ? `  ${line}` : line)));
+  }
+
+  if (all.unreadable.length > 0) {
+    const unreadableCount = all.unreadable.length;
+    const names = all.unreadable
+      .slice(0, UNREADABLE_SHOWN)
+      .map((dir) => `    ${printable(dir, true)}`);
+    lines.push(
+      ...notice(
+        c.yellow('!'),
+        `${plural(unreadableCount, 'folder')} couldn't be opened and ${unreadableCount === 1 ? 'was' : 'were'} skipped, usually for lack of permission:`,
+        width,
+      ),
+      ...names,
+    );
+    if (unreadableCount > UNREADABLE_SHOWN) {
+      lines.push(
+        c.dim(`    …and ${unreadableCount - UNREADABLE_SHOWN} more (--json lists them all)`),
+      );
+    }
+    lines.push('');
+  }
+
+  lines.push(...summaryAll(all, c, paint, options.details ?? false, width));
+  return `${lines.join('\n')}\n`;
+}
+
+function painter(c: Colors): Record<Severity, Paint> {
+  return {
     critical: (text) => c.bold(c.red(text)),
     high: c.red,
     medium: c.yellow,
     low: c.cyan,
   };
-  const groups = groupByFile(result.findings);
-  const width = options.width;
-  // The compact list aligns columns across every group, so the whole list reads as one table.
-  const columns = columnWidths(result.findings);
+}
 
-  const lines =
-    options.showName === false
-      ? [`  ${c.dim(`Results for ${options.target}`)}`, '']
-      : ['', `  ${c.bold(c.cyan('devsweep'))}  ${c.dim(options.target)}`, ''];
-  for (const group of groups) {
+/** The report's first lines. Without the banner on screen, it names devsweep too. */
+function header(
+  withBanner: string,
+  withoutBanner: string,
+  c: Colors,
+  showName: boolean | undefined,
+): string[] {
+  return showName === false
+    ? [`  ${c.dim(withBanner)}`, '']
+    : ['', `  ${c.bold(c.cyan('devsweep'))}  ${c.dim(withoutBanner)}`, ''];
+}
+
+/** Findings grouped by file, then warnings and errors. Ends with a blank line when not empty. */
+function resultBody(
+  result: ScanResult,
+  columns: Columns,
+  c: Colors,
+  paint: Record<Severity, Paint>,
+  options: PrettyOptions,
+): string[] {
+  const width = options.width;
+  const lines: string[] = [];
+  for (const group of groupByFile(result.findings)) {
     lines.push(
       `  ${group.file === undefined ? c.bold('GitHub repository settings') : formatPath(group.file, c)}`,
     );
@@ -76,19 +182,18 @@ export function formatPretty(result: ScanResult, options: PrettyOptions): string
   }
 
   const notices = [
-    ...result.warnings.map(
-      (w) =>
-        `  ${c.yellow('!')} ${truncate(printable(`${w.file ? `${w.file}  ` : ''}${firstLine(w.message)}`, true), width, 4)}`,
-    ),
-    ...result.errors.map(
-      (e) =>
-        `  ${c.red('×')} ${truncate(printable(`check "${e.checkId}" failed: ${firstLine(e.message)}`, true), width, 4)}`,
+    ...result.warnings.flatMap((w) => notice(c.yellow('!'), w.message, width, w.file || undefined)),
+    ...result.errors.flatMap((e) =>
+      // A config error names the file itself; "check config failed" would read oddly.
+      notice(
+        c.red('×'),
+        e.checkId === 'config' ? e.message : `check "${e.checkId}" failed: ${e.message}`,
+        width,
+      ),
     ),
   ];
   if (notices.length > 0) lines.push(...notices, '');
-
-  lines.push(...summary(result, c, paint, options.details ?? false));
-  return `${lines.join('\n')}\n`;
+  return lines;
 }
 
 /** One line per finding: severity, line number, title and a short subject. */
@@ -125,18 +230,19 @@ function detailed(
   paint: Record<Severity, Paint>,
   options: PrettyOptions,
 ): string[] {
-  const textWidth = Math.max(
-    Math.min(options.width ?? MAX_TEXT_WIDTH, MAX_TEXT_WIDTH) - 6,
-    MIN_TEXT_WIDTH,
-  );
+  const textWidth = textWidthAfter(6, options.width);
   const indent = (text: string) => `      ${text}`;
   const lines = [
     `    ${paint[f.severity](`${DOT} ${f.severity}`)}  ${c.bold(title(f))}${f.line ? c.dim(`  line ${f.line}`) : ''}`,
     ...wrap(printable(f.message), textWidth).map(indent),
   ];
 
-  const excerpt = codeExcerpt(f, options.readLines, textWidth, c, paint[f.severity]);
-  if (excerpt.length > 0) lines.push('', ...excerpt.map(indent));
+  if (HIDES_SOURCE.has(f.ruleId)) {
+    lines.push('', ...wrap(SOURCE_HIDDEN_NOTE, textWidth).map((line) => indent(c.dim(line))));
+  } else {
+    const excerpt = codeExcerpt(f, options.readLines, textWidth, c, paint[f.severity]);
+    if (excerpt.length > 0) lines.push('', ...excerpt.map(indent));
+  }
 
   if (f.remediation) {
     const fix = wrap(`Fix: ${printable(f.remediation)}`, textWidth);
@@ -187,43 +293,197 @@ function codeExcerpt(
   return lines;
 }
 
+/**
+ * A warning or error, word-wrapped like the details text, with later lines indented under the
+ * text. A file name comes first, set off by two spaces.
+ */
+function notice(mark: string, message: string, width: number | undefined, file?: string): string[] {
+  const room = textWidthAfter(4, width);
+  const body = printable(firstLine(message), true);
+  const name = file === undefined ? undefined : printable(file, true);
+  let lines: string[];
+  if (name === undefined) {
+    lines = wrap(body, room);
+  } else {
+    // wrap() joins words with one space; leave room for the second one after the file name.
+    lines = wrap(`${name} ${body}`, room - 1);
+    const first = lines[0];
+    if (first?.startsWith(`${name} `)) lines[0] = `${name}  ${first.slice(name.length + 1)}`;
+  }
+  return lines.map((line, i) => `${i === 0 ? `  ${mark} ` : '    '}${line}`);
+}
+
+/** Room for wrapped text after `indent` columns, within the bounds above. */
+function textWidthAfter(indent: number, width: number | undefined): number {
+  return Math.max(Math.min(width ?? MAX_TEXT_WIDTH, MAX_TEXT_WIDTH) - indent, MIN_TEXT_WIDTH);
+}
+
+/**
+ * Says what was scanned when it wasn't the files: either nothing at all, or only the settings on
+ * GitHub. Undefined when files were read, or when a check crashed (the summary says so already).
+ */
+function coverageNote(result: ScanResult): { nothing: boolean; text: string } | undefined {
+  const coverage = result.coverage;
+  if (!coverage || coverage.filesRead || result.errors.length > 0) return undefined;
+  const lookedFor =
+    coverage.lookedFor.length > 0
+      ? `devsweep looks for ${list(coverage.lookedFor)}, and found none here.`
+      : '';
+  if (coverage.github) {
+    return {
+      nothing: false,
+      text: `Only the GitHub repository settings were checked. ${lookedFor}`.trim(),
+    };
+  }
+  return { nothing: true, text: lookedFor };
+}
+
 function summary(
   result: ScanResult,
   c: Colors,
   paint: Record<Severity, Paint>,
   details: boolean,
+  width: number | undefined,
 ): string[] {
-  const accepted = result.accepted.length;
-  const warned = result.warnings.length;
-  const extra = [
-    accepted > 0 ? c.dim(`· ${accepted} accepted`) : '',
-    warned > 0 ? c.yellow(`· ${warned} ${warned === 1 ? 'warning' : 'warnings'}`) : '',
-    c.dim(`· ${result.durationMs} ms`),
-  ]
-    .filter(Boolean)
-    .map((part) => `  ${part}`)
-    .join('');
   const failed = result.errors.length;
   const lines =
     failed > 0
       ? [
-          `  ${c.red('×')} ${c.bold('Scan incomplete:')} ${failed} ${failed === 1 ? 'check' : 'checks'} failed, so some issues may be missing.`,
+          `  ${c.red('×')} ${c.bold('Scan incomplete:')} ${plural(failed, 'check')} failed, so some issues may be missing.`,
         ]
       : [];
+  const note = coverageNote(result);
+  lines.push(
+    ...totals(
+      result.findings,
+      {
+        accepted: result.accepted.length,
+        warned: result.warnings.length,
+        failed: failed > 0,
+        duration: `${result.durationMs} ms`,
+        nothing: note?.nothing ?? false,
+        note: note?.text
+          ? wrap(note.text, textWidthAfter(2, width)).map((l) => c.dim(`  ${l}`))
+          : [],
+      },
+      c,
+      paint,
+      details,
+    ),
+  );
+  return lines;
+}
 
-  const counts = summarize(result.findings);
+interface Totals {
+  accepted: number;
+  warned: number;
+  /** A check failed, so "No issues found" isn't shown as a pass. */
+  failed: boolean;
+  duration?: string;
+  /** Nothing was found to read: say "Nothing to scan" rather than "No issues found". */
+  nothing?: boolean;
+  /** Dim lines shown under the counts. */
+  note?: string[];
+}
+
+/** The issue counts by severity, or "No issues found", then the --details hint. */
+function totals(
+  findings: readonly Finding[],
+  t: Totals,
+  c: Colors,
+  paint: Record<Severity, Paint>,
+  details: boolean,
+): string[] {
+  const extra = [
+    t.accepted > 0 ? c.dim(`· ${count(t.accepted)} accepted`) : '',
+    t.warned > 0 ? c.yellow(`· ${plural(t.warned, 'warning')}`) : '',
+    t.duration ? c.dim(`· ${t.duration}`) : '',
+  ]
+    .filter(Boolean)
+    .map((part) => `  ${part}`)
+    .join('');
+  const note = t.note ?? [];
+  const counts = summarize(findings);
   if (counts.total === 0) {
-    lines.push(`  ${failed > 0 ? c.dim(DOT) : c.green(DOT)} No issues found${extra}`);
-    return lines;
+    // An empty folder isn't a clean one: say so, rather than "No issues found".
+    const line =
+      t.nothing && t.accepted === 0
+        ? `  ${c.dim(DOT)} Nothing to scan${extra}`
+        : `  ${t.failed ? c.dim(DOT) : c.green(DOT)} No issues found${extra}`;
+    return [line, ...note];
   }
-
   const bySeverity = SEVERITIES.filter((s) => counts[s] > 0).map((s) =>
     paint[s](`${counts[s]} ${s}`),
   );
-  const issues = c.bold(`${counts.total} ${counts.total === 1 ? 'issue' : 'issues'}`);
-  lines.push(`  ${issues}  ${bySeverity.join('  ')}${extra}`);
+  const lines = [
+    `  ${c.bold(plural(counts.total, 'issue'))}  ${bySeverity.join('  ')}${extra}`,
+    ...note,
+  ];
   if (!details) lines.push(c.dim('  Add --details to see why each one matters and how to fix it.'));
   return lines;
+}
+
+/**
+ * "Scanned 42 projects, 3 with findings, 2 folders couldn't be opened", then the issue counts
+ * across every project.
+ */
+function summaryAll(
+  all: ScanAllResult,
+  c: Colors,
+  paint: Record<Severity, Paint>,
+  details: boolean,
+  width: number | undefined,
+): string[] {
+  const results = all.projects.map((project) => project.result);
+  const searched = c.dim(
+    `  · ${plural(all.foldersSearched, 'folder')} searched  · ${formatDuration(all.durationMs)}`,
+  );
+  const unreadable =
+    all.unreadable.length > 0
+      ? `, ${plural(all.unreadable.length, 'folder')} couldn't be opened`
+      : '';
+
+  if (results.length === 0) {
+    return [
+      `  ${c.dim(DOT)} No projects found${unreadable}${searched}`,
+      ...wrap(
+        `devsweep looks for folders that contain ${list(PROJECT_MARKERS, 'or')}, and found none here.`,
+        textWidthAfter(2, width),
+      ).map((l) => c.dim(`  ${l}`)),
+    ];
+  }
+
+  const lines: string[] = [];
+  const failed = results.filter((r) => r.errors.length > 0).length;
+  if (failed > 0) {
+    lines.push(
+      `  ${c.red('×')} ${c.bold('Scan incomplete:')} ${plural(failed, 'project')} had a check fail or a broken config file, so some issues may be missing.`,
+    );
+  }
+  const withFindings = results.filter((r) => r.findings.length > 0).length;
+  lines.push(
+    `  ${c.bold(`Scanned ${plural(results.length, 'project')}`)}, ${withFindings === 0 ? 'none' : withFindings} with findings${unreadable}${searched}`,
+  );
+
+  lines.push(
+    ...totals(
+      results.flatMap((r) => r.findings),
+      {
+        accepted: results.reduce((sum, r) => sum + r.accepted.length, 0),
+        warned: results.reduce((sum, r) => sum + r.warnings.length, 0),
+        failed: failed > 0,
+      },
+      c,
+      paint,
+      details,
+    ),
+  );
+  return lines;
+}
+
+/** "840 ms", "4.2 s". */
+function formatDuration(ms: number): string {
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
 }
 
 /** Groups findings by file. Files with the most severe findings come first. */

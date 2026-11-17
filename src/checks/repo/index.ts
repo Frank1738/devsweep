@@ -1,5 +1,4 @@
 import { GitHubClient, segment } from '../../github/client.js';
-import { findGitHubRepository } from '../../github/repository.js';
 import type { Check } from '../../types.js';
 import { type RepoContext, type Repository, reason } from './api.js';
 import { checkForcePushAllowed, forcePushAllowed } from './force-push-allowed.js';
@@ -21,7 +20,7 @@ export const repoCheck: Check = {
   async run(ctx) {
     if (ctx.offline) return [];
 
-    const ref = await findGitHubRepository(ctx.root, ctx.env);
+    const ref = await ctx.repository();
     if (!ref) {
       ctx.warn(
         "Couldn't check GitHub repository settings: no GitHub repository found. Set " +
@@ -50,6 +49,7 @@ export const repoCheck: Check = {
       ctx.warn(`Couldn't check GitHub repository settings for ${slug}: ${reason(error)}`);
       return [];
     }
+    ctx.scannedGitHub();
 
     const gh: RepoContext = {
       api,

@@ -11,6 +11,7 @@ import {
   loadConfig,
 } from './config.js';
 import { errorMessage } from './errors.js';
+import { findGitHubRepository, type RepositoryRef } from './github/repository.js';
 import {
   type Check,
   type Env,
@@ -20,6 +21,7 @@ import {
   type ScanWarning,
   SEVERITIES,
 } from './types.js';
+import type { ReadDir } from './walk.js';
 
 export interface ScanOptions {
   /** Directory to scan. Relative paths resolve against the current working directory. */
@@ -37,6 +39,13 @@ export interface ScanOptions {
   env?: Env | undefined;
   /** Used for GitHub API calls. Defaults to the global fetch; tests pass a fake. */
   fetch?: typeof fetch | undefined;
+  /**
+   * Folders inside `root` to leave out of checks that read every file, as paths from `root` with
+   * forward slashes. `--all` passes the projects nested in this one.
+   */
+  skipFolders?: readonly string[] | undefined;
+  /** Lists a folder. `--all` passes the listings it already read while searching. */
+  readdir?: ReadDir | undefined;
 }
 
 export class ScanTargetError extends Error {}
@@ -60,25 +69,40 @@ export async function scan(options: ScanOptions): Promise<ScanResult> {
   const errors: ScanError[] = [];
   const offline = options.offline ?? false;
   const skipped = offline ? checks.filter((check) => check.network) : [];
+  const active = checks.filter((check) => !skipped.includes(check));
+  let filesRead = false;
+  const env = options.env ?? process.env;
+  let repository: Promise<RepositoryRef | undefined> | undefined;
+  let scannedGitHub = false;
 
   const perCheck = await Promise.all(
-    checks
-      .filter((check) => !skipped.includes(check))
-      .map(async (check) => {
-        try {
-          return await check.run({
-            root,
-            warn: (message, file) =>
-              warnings.push({ checkId: check.id, message, ...(file !== undefined && { file }) }),
-            offline,
-            env: options.env ?? process.env,
-            fetch: options.fetch ?? globalThis.fetch,
-          });
-        } catch (error) {
-          errors.push({ checkId: check.id, message: errorMessage(error) });
-          return [];
-        }
-      }),
+    active.map(async (check) => {
+      try {
+        return await check.run({
+          root,
+          skipFolders: options.skipFolders,
+          readdir: options.readdir,
+          warn: (message, file) =>
+            warnings.push({ checkId: check.id, message, ...(file !== undefined && { file }) }),
+          scannedFile: () => {
+            filesRead = true;
+          },
+          scannedGitHub: () => {
+            scannedGitHub = true;
+          },
+          offline,
+          repository: () => {
+            repository ??= findGitHubRepository(root, env);
+            return repository;
+          },
+          env,
+          fetch: options.fetch ?? globalThis.fetch,
+        });
+      } catch (error) {
+        errors.push({ checkId: check.id, message: errorMessage(error) });
+        return [];
+      }
+    }),
   );
 
   const configured = applyConfig(
@@ -105,6 +129,11 @@ export async function scan(options: ScanOptions): Promise<ScanResult> {
     warnings,
     errors,
     durationMs: Math.round(performance.now() - started),
+    coverage: {
+      filesRead,
+      lookedFor: active.flatMap((check) => check.looksFor ?? []),
+      github: scannedGitHub,
+    },
     ...(Object.keys(config.severity).length > 0 && {
       severityOverrides: { ...config.severity },
     }),
@@ -151,7 +180,8 @@ export function compareFindings(a: Finding, b: Finding): number {
   );
 }
 
-async function assertDirectory(root: string): Promise<void> {
+/** Rejects with ScanTargetError when `root` is missing or not a folder. */
+export async function assertDirectory(root: string): Promise<void> {
   let isDirectory: boolean;
   try {
     isDirectory = (await stat(root)).isDirectory();

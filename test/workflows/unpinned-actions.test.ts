@@ -36,6 +36,36 @@ describe('workflow/unpinned-action', () => {
     expect(finding?.message).toContain('has no version');
   });
 
+  it("labels the organisation's own actions as its own, keeping rule, severity and subject", () => {
+    const uses = 'Example-Org/deploy@v2';
+    const [own] = analyze(workflow(stepUses(uses)), { owner: 'example-org' });
+    const [other] = analyze(workflow(stepUses(uses)), { owner: 'someone-else' });
+    expect(own?.message).toBe(
+      'Action "Example-Org/deploy" is your organisation\'s own, but it is pinned to "v2", a tag ' +
+        'or branch anyone with write access to it can move.',
+    );
+    expect(other?.message).toBe(
+      'Third-party action "Example-Org/deploy" is pinned to "v2", a tag or branch its owner can move.',
+    );
+    // Acceptances match on rule, file and subject, so these must not change.
+    const { message: _own, ...ownRest } = own ?? {};
+    const { message: _other, ...otherRest } = other ?? {};
+    expect(ownRest).toEqual(otherRest);
+    expect(own).toMatchObject({
+      ruleId: 'workflow/unpinned-action',
+      severity: 'high',
+      subject: uses,
+    });
+  });
+
+  it("labels the organisation's own action with no version", () => {
+    const [finding] = analyze(workflow(stepUses('example-org/deploy')), { owner: 'example-org' });
+    expect(finding?.message).toBe(
+      'Action "example-org/deploy" is your organisation\'s own, but it has no version, so it can ' +
+        'change at any time.',
+    );
+  });
+
   it('suggests a SHA pin that keeps the tag as a comment', () => {
     const [finding] = analyze(workflow(stepUses('example-org/deploy@v2')));
     expect(finding?.remediation).toBe(

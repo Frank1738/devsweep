@@ -201,6 +201,126 @@
                 "precision": "high",
                 "security-severity": "8.0"
               }
+            },
+            {
+              "id": "code/autorun-task",
+              "shortDescription": {
+                "text": "Task runs when the folder opens"
+              },
+              "fullDescription": {
+                "text": "A VS Code task with \"runOn\": \"folderOpen\" runs a command as soon as someone opens the folder, before they've read any of the code. The PolinRider malware campaign hides its loader this way in fake take-home assignments and infected repositories. Some real projects use it to start a file watcher, so a plain auto-run task is medium. It is critical when the task also runs node, a shell or python on a file that isn't a script (such as a font), pipes a download into a shell, hides its output, or contacts a vercel.app /settings/ address. It is high when .vscode/settings.json also sets \"task.allowAutomaticTasks\" to \"on\", which tries to let tasks run without VS Code asking first."
+              },
+              "help": {
+                "text": "A VS Code task with \"runOn\": \"folderOpen\" runs a command as soon as someone opens the folder, before they've read any of the code. The PolinRider malware campaign hides its loader this way in fake take-home assignments and infected repositories. Some real projects use it to start a file watcher, so a plain auto-run task is medium. It is critical when the task also runs node, a shell or python on a file that isn't a script (such as a font), pipes a download into a shell, hides its output, or contacts a vercel.app /settings/ address. It is high when .vscode/settings.json also sets \"task.allowAutomaticTasks\" to \"on\", which tries to let tasks run without VS Code asking first.\n\nHow to fix: Open .vscode/tasks.json in a plain text editor, without opening the folder in VS Code, and read the task's \"command\" and \"args\" to see what it runs. If you don't recognise the task, delete it from the \"tasks\" list, and check the files it names and the rest of the repository before you open it in VS Code. If the project really needs it, accept the finding in devsweep.config.json. Either way, set \"task.allowAutomaticTasks\": \"off\" in your own VS Code user settings, so no folder can run tasks without asking you.",
+                "markdown": "A VS Code task with \"runOn\": \"folderOpen\" runs a command as soon as someone opens the folder, before they've read any of the code. The PolinRider malware campaign hides its loader this way in fake take-home assignments and infected repositories. Some real projects use it to start a file watcher, so a plain auto-run task is medium. It is critical when the task also runs node, a shell or python on a file that isn't a script (such as a font), pipes a download into a shell, hides its output, or contacts a vercel.app /settings/ address. It is high when .vscode/settings.json also sets \"task.allowAutomaticTasks\" to \"on\", which tries to let tasks run without VS Code asking first.\n\n## How to fix\n\nOpen .vscode/tasks.json in a plain text editor, without opening the folder in VS Code, and read the task's \"command\" and \"args\" to see what it runs. If you don't recognise the task, delete it from the \"tasks\" list, and check the files it names and the rest of the repository before you open it in VS Code. If the project really needs it, accept the finding in devsweep.config.json. Either way, set \"task.allowAutomaticTasks\": \"off\" in your own VS Code user settings, so no folder can run tasks without asking you."
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "code"
+                ],
+                "precision": "high",
+                "security-severity": "5.5"
+              }
+            },
+            {
+              "id": "code/hidden-padding",
+              "shortDescription": {
+                "text": "Code hidden after a long run of spaces"
+              },
+              "fullDescription": {
+                "text": "A line has 64 or more spaces or tabs in a row, then more code. Code that far to the right is off-screen in most editors and in GitHub's diff view, so a reviewer doesn't see it. Every known variant of the PolinRider malware campaign hides its loader this way, at the end of a real file such as a build config. Critical when the hidden code also runs text as code (eval, new Function), decodes base64 (atob, Buffer.from) or sets a global variable. Markdown, .txt and .csv files are skipped, and so is padding followed by a comment."
+              },
+              "help": {
+                "text": "A line has 64 or more spaces or tabs in a row, then more code. Code that far to the right is off-screen in most editors and in GitHub's diff view, so a reviewer doesn't see it. Every known variant of the PolinRider malware campaign hides its loader this way, at the end of a real file such as a build config. Critical when the hidden code also runs text as code (eval, new Function), decodes base64 (atob, Buffer.from) or sets a global variable. Markdown, .txt and .csv files are skipped, and so is padding followed by a comment.\n\nHow to fix: Open the file in a plain text editor with line wrapping on, or scroll to the line's end, and read what follows the spaces. If you didn't write it, don't build or run the project: delete the hidden code, check the file's git history for who added it, and check the rest of the repository and your machine. If the long line is intended, such as generated data, accept the finding in devsweep.config.json.",
+                "markdown": "A line has 64 or more spaces or tabs in a row, then more code. Code that far to the right is off-screen in most editors and in GitHub's diff view, so a reviewer doesn't see it. Every known variant of the PolinRider malware campaign hides its loader this way, at the end of a real file such as a build config. Critical when the hidden code also runs text as code (eval, new Function), decodes base64 (atob, Buffer.from) or sets a global variable. Markdown, .txt and .csv files are skipped, and so is padding followed by a comment.\n\n## How to fix\n\nOpen the file in a plain text editor with line wrapping on, or scroll to the line's end, and read what follows the spaces. If you didn't write it, don't build or run the project: delete the hidden code, check the file's git history for who added it, and check the rest of the repository and your machine. If the long line is intended, such as generated data, accept the finding in devsweep.config.json."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "code"
+                ],
+                "precision": "high",
+                "security-severity": "8.0"
+              }
+            },
+            {
+              "id": "code/disguised-file",
+              "shortDescription": {
+                "text": "Font file that isn't a font"
+              },
+              "fullDescription": {
+                "text": "A file named like a font (.woff2, .woff, .ttf, .otf or .eot) whose first bytes are not any font format, or a font-like name no font uses, such as fa-solid-400.llf. The PolinRider malware campaign hides its JavaScript in fake Font Awesome fonts, then runs them with node from a VS Code task or an npm script. Critical when the file is mostly readable text, or a command in .vscode/tasks.json or package.json names it. Empty files and Git LFS pointers (the small text files left in place of fonts stored in Git LFS) are skipped."
+              },
+              "help": {
+                "text": "A file named like a font (.woff2, .woff, .ttf, .otf or .eot) whose first bytes are not any font format, or a font-like name no font uses, such as fa-solid-400.llf. The PolinRider malware campaign hides its JavaScript in fake Font Awesome fonts, then runs them with node from a VS Code task or an npm script. Critical when the file is mostly readable text, or a command in .vscode/tasks.json or package.json names it. Empty files and Git LFS pointers (the small text files left in place of fonts stored in Git LFS) are skipped.\n\nHow to fix: Don't run the file. Open it in a plain text editor: a real font is unreadable binary data. If it holds code, delete it, remove any task or script that runs it, and check the repository's history for who added it. If you ran the project, treat your machine as compromised and rotate tokens from a clean device. If the file is a real font in an unusual format, accept the finding in devsweep.config.json.",
+                "markdown": "A file named like a font (.woff2, .woff, .ttf, .otf or .eot) whose first bytes are not any font format, or a font-like name no font uses, such as fa-solid-400.llf. The PolinRider malware campaign hides its JavaScript in fake Font Awesome fonts, then runs them with node from a VS Code task or an npm script. Critical when the file is mostly readable text, or a command in .vscode/tasks.json or package.json names it. Empty files and Git LFS pointers (the small text files left in place of fonts stored in Git LFS) are skipped.\n\n## How to fix\n\nDon't run the file. Open it in a plain text editor: a real font is unreadable binary data. If it holds code, delete it, remove any task or script that runs it, and check the repository's history for who added it. If you ran the project, treat your machine as compromised and rotate tokens from a clean device. If the file is a real font in an unusual format, accept the finding in devsweep.config.json."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "code"
+                ],
+                "precision": "high",
+                "security-severity": "8.0"
+              }
+            },
+            {
+              "id": "code/propagation-script",
+              "shortDescription": {
+                "text": "PolinRider propagation script"
+              },
+              "fullDescription": {
+                "text": "The PolinRider malware spreads with batch scripts named temp_auto_push.bat and temp_interactive_push.bat: they rewrite git history and force-push the infection to every repository the infected machine can write to. Either file anywhere in a project is critical. A .gitignore line that is exactly config.bat, temp_auto_push.bat or branch_structure.json is medium: it doesn't mean the payload is here, but suggests a contributor's machine was infected and pushed to this repository."
+              },
+              "help": {
+                "text": "The PolinRider malware spreads with batch scripts named temp_auto_push.bat and temp_interactive_push.bat: they rewrite git history and force-push the infection to every repository the infected machine can write to. Either file anywhere in a project is critical. A .gitignore line that is exactly config.bat, temp_auto_push.bat or branch_structure.json is medium: it doesn't mean the payload is here, but suggests a contributor's machine was infected and pushed to this repository.\n\nHow to fix: Don't run the script. Delete it, and treat the machine that created it as compromised: rotate its GitHub tokens and SSH keys from a clean device. Check the repository for force pushes (devsweep's repo/force-push-detected rule does this with a GitHub token) and compare recent commits with what their authors remember writing.",
+                "markdown": "The PolinRider malware spreads with batch scripts named temp\\_auto\\_push.bat and temp\\_interactive\\_push.bat: they rewrite git history and force-push the infection to every repository the infected machine can write to. Either file anywhere in a project is critical. A .gitignore line that is exactly config.bat, temp\\_auto\\_push.bat or branch\\_structure.json is medium: it doesn't mean the payload is here, but suggests a contributor's machine was infected and pushed to this repository.\n\n## How to fix\n\nDon't run the script. Delete it, and treat the machine that created it as compromised: rotate its GitHub tokens and SSH keys from a clean device. Check the repository for force pushes (devsweep's repo/force-push-detected rule does this with a GitHub token) and compare recent commits with what their authors remember writing."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "code"
+                ],
+                "precision": "high",
+                "security-severity": "9.5"
+              }
+            },
+            {
+              "id": "code/known-marker",
+              "shortDescription": {
+                "text": "Known PolinRider marker"
+              },
+              "fullDescription": {
+                "text": "The file contains a string proven to come from the PolinRider malware campaign: an obfuscator marker, a campaign tag, an XOR key, a wallet address or another indicator published by the researchers who analysed it. Normal code doesn't contain these, so a match means the file is very likely infected. The list comes from meSingh/polinrider-scanner (MIT license) and is bundled with devsweep, so it works offline. The campaign changes its markers every few weeks, so code/hidden-padding is what catches new variants. Markdown files are skipped, since security write-ups quote these strings."
+              },
+              "help": {
+                "text": "The file contains a string proven to come from the PolinRider malware campaign: an obfuscator marker, a campaign tag, an XOR key, a wallet address or another indicator published by the researchers who analysed it. Normal code doesn't contain these, so a match means the file is very likely infected. The list comes from meSingh/polinrider-scanner (MIT license) and is bundled with devsweep, so it works offline. The campaign changes its markers every few weeks, so code/hidden-padding is what catches new variants. Markdown files are skipped, since security write-ups quote these strings.\n\nHow to fix: Don't build, run or open the project in your editor until it is cleaned. Remove the injected code, check the file's git history for when and how it was added, and check the other files that commit changed. If you built or ran the project, treat your machine as compromised: rotate tokens and passwords from a clean device. If the file is a security tool or a list of indicators, accept the finding in devsweep.config.json.",
+                "markdown": "The file contains a string proven to come from the PolinRider malware campaign: an obfuscator marker, a campaign tag, an XOR key, a wallet address or another indicator published by the researchers who analysed it. Normal code doesn't contain these, so a match means the file is very likely infected. The list comes from meSingh/polinrider-scanner (MIT license) and is bundled with devsweep, so it works offline. The campaign changes its markers every few weeks, so code/hidden-padding is what catches new variants. Markdown files are skipped, since security write-ups quote these strings.\n\n## How to fix\n\nDon't build, run or open the project in your editor until it is cleaned. Remove the injected code, check the file's git history for when and how it was added, and check the other files that commit changed. If you built or ran the project, treat your machine as compromised: rotate tokens and passwords from a clean device. If the file is a security tool or a list of indicators, accept the finding in devsweep.config.json."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "code"
+                ],
+                "precision": "high",
+                "security-severity": "9.5"
+              }
             }
           ]
         }

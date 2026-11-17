@@ -1,3 +1,6 @@
+import type { RepositoryRef } from './github/repository.js';
+import type { ReadDir } from './walk.js';
+
 export const SEVERITIES = ['critical', 'high', 'medium', 'low'] as const;
 
 export type Severity = (typeof SEVERITIES)[number];
@@ -13,6 +16,11 @@ export interface Rule {
   description: string;
   /** How to fix it in general. Findings carry their own, more specific advice. */
   remediation: string;
+  /**
+   * True when the line a finding points at may be malicious code, such as a hidden payload.
+   * Reports then never print that line, not even as a code excerpt in `--details`.
+   */
+  hidesSource?: boolean;
 }
 
 export interface Position {
@@ -43,8 +51,28 @@ export interface Finding {
 export interface ScanContext {
   /** Absolute path of the directory being scanned. */
   root: string;
+  /**
+   * Folders inside `root` that checks reading every file must leave out, as paths from `root`
+   * with forward slashes. `--all` sets it to the projects nested in this one, which it scans on
+   * their own, so no file is reported twice.
+   */
+  skipFolders?: readonly string[] | undefined;
   /** Report something the check couldn't analyze, without failing the scan. */
   warn(message: string, file?: string): void;
+  /**
+   * Record that the check found a file and read it, so the report can tell a folder with nothing
+   * to scan apart from a clean one.
+   */
+  scannedFile(): void;
+  /** Record that the repository's settings on GitHub were read. */
+  scannedGitHub(): void;
+  /**
+   * The repository on GitHub, from the git remote or GITHUB_REPOSITORY. Looked up once per scan
+   * and shared by every check that asks.
+   */
+  repository(): Promise<RepositoryRef | undefined>;
+  /** Lists a folder. `--all` passes the listings it already read while searching for projects. */
+  readdir?: ReadDir | undefined;
   /** True when the user asked for no network access (`--offline`). */
   offline: boolean;
   /** Environment variables, for tokens and CI settings. Never print token values. */
@@ -62,6 +90,11 @@ export interface Check {
   rules: readonly Rule[];
   /** True when the check calls the network. `--offline` skips it without running it. */
   network?: boolean;
+  /**
+   * The files this check reads, as shown to the user when none of them exist, e.g.
+   * `.vscode/tasks.json`. Set on every check that reads files from the scanned folder.
+   */
+  looksFor?: readonly string[];
   run(ctx: ScanContext): Promise<Finding[]>;
 }
 
@@ -98,6 +131,21 @@ export interface ScanResult {
    * reports that also describe each rule, like SARIF. Absent when the config sets none.
    */
   severityOverrides?: Record<string, Severity>;
+  /**
+   * What the scan found to read. Without it, reports assume something was scanned, so results
+   * built by hand (or by older code) read as before.
+   */
+  coverage?: Coverage;
+}
+
+/** What a scan found to read. Lets a report tell "nothing to scan" apart from "nothing wrong". */
+export interface Coverage {
+  /** True when the checks found at least one file to read. */
+  filesRead: boolean;
+  /** What the file-based checks that ran looked for, e.g. `.vscode/tasks.json`. */
+  lookedFor: string[];
+  /** True when the repository's settings on GitHub were read. */
+  github: boolean;
 }
 
 export interface FindingInput {
@@ -123,4 +171,28 @@ export function createFinding(rule: Rule, input: FindingInput): Finding {
     ...(at?.column !== undefined && { column: at.column }),
     remediation: remediation ?? rule.remediation,
   };
+}
+
+/** One project's results from a scan with `--all`. */
+export interface ProjectScan {
+  /** Path from the folder searched, with forward slashes. "." when it is that folder itself. */
+  path: string;
+  /**
+   * The project's scan. A project whose scan couldn't start, such as one with a broken config
+   * file, has no findings and one error saying why.
+   */
+  result: ScanResult;
+}
+
+/** The results of `--all`: every project found under a folder, each scanned on its own. */
+export interface ScanAllResult {
+  /** Absolute path of the folder searched. */
+  root: string;
+  /** Sorted by path. */
+  projects: ProjectScan[];
+  /** How many folders were searched for projects. */
+  foldersSearched: number;
+  /** Folders that couldn't be opened, such as ones without permission. Absolute paths, sorted. */
+  unreadable: string[];
+  durationMs: number;
 }

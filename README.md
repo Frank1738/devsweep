@@ -2,7 +2,7 @@
 
 Scan your dev setup and repos for the supply-chain and credential risks that infostealers exploit.
 
-> **Status:** early development (0.x). Workflow and repository-settings checks work, with SARIF output (the report format GitHub's Security tab reads) and a GitHub Action. Dependency and secret checks are next.
+> **Status:** early development (0.x). Workflow, repository-settings, VS Code task and planted-code (PolinRider) checks work, with SARIF output (the report format GitHub's Security tab reads) and a GitHub Action. Dependency and secret checks are next.
 
 ![A terminal running npx @frank1738/devsweep --offline in a sample repository. The DEVSWEEP banner sweeps in, then 10 findings are listed by file: 1 critical, 6 high, 2 medium and 1 low.](assets/demo.svg)
 
@@ -12,6 +12,7 @@ Today it checks:
 
 - **GitHub Actions workflows** (the `.github/workflows/*.yml` files): for example, actions that could be swapped for different code, workflows that run strangers' pull request code with your secrets, and tokens with more access than they need.
 - **The repository's settings on GitHub**: whether the default branch and release tags can be force-pushed (overwritten), and whether someone did so recently.
+- **VS Code tasks** (the `.vscode/tasks.json` file): tasks that run a command as soon as you open the folder. Malware campaigns such as PolinRider use this to infect developers who open a fake take-home assignment or an infected repository.
 
 Run it on your own machine, or in CI (continuous integration: the checks that run automatically on every push) as a [GitHub Action](#github-action).
 
@@ -32,7 +33,7 @@ npm install -g @frank1738/devsweep
 devsweep
 ```
 
-To list every option, run `npx @frank1738/devsweep scan --help` (or `devsweep scan --help`). Keep the word `scan` in there: for now, `--help` on its own doesn't show the options. [Usage](#usage) has the details.
+To list every option, run `npx @frank1738/devsweep --help` (or `devsweep --help`). [Usage](#usage) has the details.
 
 ### Reading the output
 
@@ -69,6 +70,7 @@ You may also see lines that this example doesn't have:
 
 - Findings about the repository's settings on GitHub (the `repo/*` rules) aren't in any file. They're listed under **GitHub repository settings**, with no line number.
 - A line that starts with `!` is a warning, not a finding. For example, a workflow file devsweep skipped because it isn't valid YAML. A line that starts with `×` means a check crashed, so the results are incomplete.
+- **Nothing to scan** means devsweep found none of the files it reads (workflows in `.github/workflows`, `.vscode/tasks.json`, and any text file for the planted-code rules), so there was nothing to check. That's different from "No issues found". If it could still read the repository's settings on GitHub, it says "No issues found" and adds that only the GitHub settings were checked.
 
 Add `--details` (or `-d`) to see, for each finding, why it's a risk, the lines of code involved, how to fix it, and the ID of the rule that found it. Here are the first two findings from the same scan:
 
@@ -91,7 +93,7 @@ Every release is built by GitHub Actions and published with [provenance](https:/
 
 Here's the whole flow at a glance: what devsweep reads, and what it gives back. The rest of this section covers each part.
 
-![How devsweep works. It reads workflow files from the folder you scan, and repository settings through the GitHub API (this needs a token, and --offline skips it). It runs 8 rules, 6 for workflows and 2 for repository settings, adjusted by an optional devsweep.config.json. It gives back a readable report, an exit code (0 pass, 1 findings, 2 error), JSON with --json, and SARIF with --sarif for GitHub's Security tab.](assets/how-it-works.svg)
+![How devsweep works. It reads workflow files, .vscode/tasks.json and every other text file from the folder you scan, and repository settings through the GitHub API (this needs a token, and --offline skips it). It runs 13 rules, 6 for workflows, 5 for planted code and 2 for repository settings, adjusted by an optional devsweep.config.json. It gives back a readable report, an exit code (0 pass, 1 findings, 2 error), JSON with --json, and SARIF with --sarif for GitHub's Security tab.](assets/how-it-works.svg)
 
 ```sh
 npx @frank1738/devsweep [path] [options]
@@ -106,14 +108,40 @@ npx @frank1738/devsweep [path] --sarif          # SARIF 2.1.0, the format GitHub
 npx @frank1738/devsweep [path] --sarif -o FILE  # save the report to FILE, and show the readable one
 npx @frank1738/devsweep [path] --fail-on high   # fail only on high or critical findings
 npx @frank1738/devsweep [path] --offline        # skip the checks that call the GitHub API
+npx @frank1738/devsweep [path] --all            # find every project under path and scan each one
 npx @frank1738/devsweep [path] --no-color       # turn off colors
 ```
 
-To see every option, run `npx @frank1738/devsweep scan --help`. Include `scan`: for now, `--help` on its own lists only the `scan` command, not its options. `scan` is the default command, so you can leave it out everywhere else. `--version` prints the version.
+To see every option, run `npx @frank1738/devsweep --help`. `scan` is the default command, so you can leave it out. `--version` prints the version.
 
 - `--json` and `--sarif` can't be used together. Either one prints its report instead of the readable one, unless you also pass `-o`.
 - `-o`/`--output` works only with `--json` or `--sarif`. It creates missing folders, and the terminal (or CI log) still shows the readable report.
 - In a terminal window that's wide enough, devsweep opens with a gradient banner that sweeps in, and shows a sweep line if the scan takes a moment. In CI, or when output is piped, the output is plain text with no animation. `--no-color` or the `NO_COLOR` environment variable turns colors off anywhere.
+
+### Scanning every project in a folder
+
+`--all` searches a folder for projects and scans each one. A project is any folder that contains `.git`, `.github/workflows` or `.vscode/tasks.json`. Projects inside other projects are found too. Each project is scanned with its own `devsweep.config.json`.
+
+To scan a whole drive from Windows Command Prompt:
+
+```bat
+npx @frank1738/devsweep C:\ --all
+```
+
+Or every project in one folder:
+
+```bat
+npx @frank1738/devsweep C:\Users\me\Projects --all
+```
+
+- **Projects inside projects** are scanned once each. A repository cloned inside another is its own project in the results, and the outer project's scan leaves its folder out, so no file is read or reported twice. (Without `--all`, the folder you name is one project, and everything inside it is scanned as part of it.)
+- **How long it takes** depends on how many folders and files there are. devsweep finds projects from folder listings, then reads each project's text files once for the planted-code rules. It skips `node_modules`, the inside of `.git`, every `AppData` folder, and Windows system folders at the top of a drive (`Windows`, `Program Files`, `Program Files (x86)`, `ProgramData`, `$Recycle.Bin`, `System Volume Information`), and inside projects it skips build tools' generated folders (`.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.vercel`, `.parcel-cache`, `.angular`). A folder of a dozen projects takes a few seconds. A drive with hundreds of thousands of folders can take a few minutes, mostly on the first run; a second run is faster because Windows remembers recent folder listings. In a terminal window, a progress line shows how many folders it has searched and how many projects it has found.
+- **Network checks are off**, as if you passed `--offline`. Checking the GitHub settings of dozens of repositories would hit GitHub's rate limit. To include them, scan one repository at a time without `--all`.
+- **Links are never followed.** Symbolic links and Windows junctions (such as `C:\Documents and Settings`, which points to `C:\Users`) are skipped, so nothing is searched twice and a link that points back to a parent folder can't loop forever.
+- **Folders devsweep isn't allowed to open** are skipped and counted, never a crash. The report names the first few, and `--json` lists them all.
+- **Output:** findings are grouped by project, then by file. Projects with nothing to report are counted but not listed. The last lines sum it up, for example `Scanned 42 projects, 3 with findings, 2 folders couldn't be opened`.
+- `--json` prints one report with totals and each project's results. `--sarif` can't be used with `--all`, because a SARIF report describes one repository for that repository's Security tab.
+- The exit code covers every project: 1 when any project has findings at or above `--fail-on`, 2 when a check crashed or a config file is broken in any project, and 0 otherwise, including when no projects were found.
 
 ### Exit codes
 
@@ -161,7 +189,7 @@ Sometimes a finding is fine for your project. When you've reviewed one and decid
 - `subject` is the text at the end of the finding's line in the readable output, such as `example-org/setup-tool@v3`. A narrow terminal can shorten it with `…`, so run with `--json` to see it exactly. Leave `subject` out only for findings that have none, such as `workflow/pull-request-target` (the first example above).
 - Findings about repository settings (the `repo/*` rules) aren't in any file, so leave `file` out for them. For example: `{ "rule": "repo/force-push-detected", "subject": "branch main 1a2b3c4..5d6e7f8", "reason": "History cleanup by a maintainer; we checked the diff." }`
 - Every acceptance needs a `reason`. Accepted findings drop out of the list and don't fail the run, but the summary counts them (`2 accepted`).
-- An acceptance that no longer matches anything shows up as a warning, so stale exceptions get cleaned up. devsweep skips that warning when it couldn't have seen the finding: when the rule's check was skipped (such as `repo/*` rules with `--offline`), crashed, or couldn't finish (such as a "couldn't check" warning, or a workflow file skipped as invalid YAML).
+- An acceptance that no longer matches anything shows up as a warning, so stale exceptions get cleaned up. devsweep skips that warning when it couldn't have seen the finding: when the rule's check was skipped (such as `repo/*` rules with `--offline`), crashed, or couldn't finish (such as a "couldn't check" warning, or a workflow file or `.vscode/tasks.json` skipped as invalid).
 - `rules` changes a rule's severity. That affects `--fail-on` and every output format.
 - Mistakes such as invalid JSON, an unknown rule, an unknown key or a missing reason stop the scan with exit code 2 and a message naming the problem.
 
@@ -171,18 +199,23 @@ Treat this file like code: it switches checks off. A [`CODEOWNERS`](https://docs
 
 ## What it checks
 
-devsweep has eight rules. Every finding names its rule ID, which is also what you write in `devsweep.config.json`. The severity shown is the default, and the config file can change it.
+devsweep has thirteen rules. Every finding names its rule ID, which is also what you write in `devsweep.config.json`. The severity shown is the default, and the config file can change it.
 
-| Rule                             | Severity            | Flags                                                                                                                                                                                                                                                                                                   |
-| -------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `workflow/untrusted-checkout`    | critical            | A `pull_request_target` workflow that checks out or fetches the pull request's code                                                                                                                                                                                                                     |
-| `workflow/unpinned-action`       | high                | A third-party action, reusable workflow or `docker://` container image that isn't pinned to a full commit SHA or image digest                                                                                                                                                                           |
-| `workflow/write-all-permissions` | high                | `permissions: write-all` at workflow or job level                                                                                                                                                                                                                                                       |
-| `workflow/pull-request-target`   | medium              | A `pull_request_target` trigger, which runs with secrets and a write token. Reported only when nothing in the workflow checks out the pull request's code; otherwise `untrusted-checkout` is reported instead                                                                                           |
-| `workflow/missing-permissions`   | medium              | No top-level `permissions:`, and jobs that don't set their own                                                                                                                                                                                                                                          |
-| `workflow/force-push`            | high, medium or low | A workflow that force-pushes, with `git push --force` (or `-f`, `--force-with-lease`, `--mirror`, a `+` refspec) or an action input such as `force: true`. High for `main`, `master`, tags, every branch at once and mirrors; medium for other branches, or when no branch is named; low for `gh-pages` |
-| `repo/force-push-allowed`        | high                | The default branch or release tags aren't protected against force pushes or being moved (read from rulesets, and for the default branch also from classic branch protection)                                                                                                                            |
-| `repo/force-push-detected`       | high                | A force push to the default branch in the last 90 days (read from the repository's activity log)                                                                                                                                                                                                        |
+| Rule                             | Severity                 | Flags                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `workflow/untrusted-checkout`    | critical                 | A `pull_request_target` workflow that checks out or fetches the pull request's code                                                                                                                                                                                                                                                                                                                                      |
+| `workflow/unpinned-action`       | high                     | A third-party action, reusable workflow or `docker://` container image that isn't pinned to a full commit SHA or image digest                                                                                                                                                                                                                                                                                            |
+| `workflow/write-all-permissions` | high                     | `permissions: write-all` at workflow or job level                                                                                                                                                                                                                                                                                                                                                                        |
+| `workflow/pull-request-target`   | medium                   | A `pull_request_target` trigger, which runs with secrets and a write token. Reported only when nothing in the workflow checks out the pull request's code; otherwise `untrusted-checkout` is reported instead                                                                                                                                                                                                            |
+| `workflow/missing-permissions`   | medium                   | No top-level `permissions:`, and jobs that don't set their own                                                                                                                                                                                                                                                                                                                                                           |
+| `workflow/force-push`            | high, medium or low      | A workflow that force-pushes, with `git push --force` (or `-f`, `--force-with-lease`, `--mirror`, a `+` refspec) or an action input such as `force: true`. High for `main`, `master`, tags, every branch at once and mirrors; medium for other branches, or when no branch is named; low for `gh-pages`                                                                                                                  |
+| `repo/force-push-allowed`        | high                     | The default branch or release tags aren't protected against force pushes or being moved (read from rulesets, and for the default branch also from classic branch protection)                                                                                                                                                                                                                                             |
+| `repo/force-push-detected`       | high                     | A force push to the default branch in the last 90 days (read from the repository's activity log)                                                                                                                                                                                                                                                                                                                         |
+| `code/autorun-task`              | medium, high or critical | A task in `.vscode/tasks.json` with `"runOn": "folderOpen"`, which runs as soon as the folder is opened in VS Code. Critical when it also runs `node`, a shell or `python` on a file that isn't a script (such as a font), pipes a download into a shell, hides its output, or contacts a `vercel.app` `/settings/` address. High when `.vscode/settings.json` sets `"task.allowAutomaticTasks": "on"`. Medium otherwise |
+| `code/hidden-padding`            | high or critical         | A line with 64 or more spaces or tabs in a row and then more code (128 or more at the start of a line), which pushes the code off-screen. Critical when the hidden code runs text as code (`eval`, `new Function`), decodes base64 (`atob`, `Buffer.from`) or sets a global variable. Skips `.md`, `.txt`, `.csv` and `.map` files, and padding inside or before a comment                                               |
+| `code/disguised-file`            | high or critical         | A file named like a font (`.woff2`, `.woff`, `.ttf`, `.otf`, `.eot`) whose first bytes aren't any font format, or a font-like name no font uses (`fa-solid-300.llf`, `fa-solid.lkf`). Critical when the file is mostly readable text, or a command in `.vscode/tasks.json` or `package.json` names it. Skips empty files and Git LFS pointer files                                                                       |
+| `code/propagation-script`        | critical or medium       | `temp_auto_push.bat` or `temp_interactive_push.bat` anywhere (critical). A `.gitignore` line that is exactly `config.bat`, `temp_auto_push.bat` or `branch_structure.json` (medium: a sign that a contributor's machine was infected)                                                                                                                                                                                    |
+| `code/known-marker`              | critical                 | A string proven to come from the PolinRider campaign, such as an obfuscator marker, campaign tag, XOR key or wallet address, from a list bundled with devsweep. Skips `.md` files                                                                                                                                                                                                                                        |
 
 Dependency and secret checks are coming next.
 
@@ -195,11 +228,14 @@ Some terms from the table:
   - uses: example-org/deploy@<40-character-sha>   # v2.1.0, not flagged
   ```
 
-  Actions owned by GitHub (`actions/…` and `github/…`) aren't flagged.
+  Actions owned by GitHub (`actions/…` and `github/…`) aren't flagged. Actions from your repository's own organisation are flagged too, because a stolen token with access to them could move their tags, but the message calls them your organisation's own instead of third-party. devsweep reads the owner from the `origin` remote in your clone (no network needed), or else from `GITHUB_REPOSITORY`.
 
 - **`GITHUB_TOKEN`** is the temporary token GitHub Actions gives each workflow run, so its steps can call GitHub to push code, comment on pull requests and so on. A workflow's `permissions:` key limits what it can do.
 - **`pull_request_target`** is a workflow trigger that runs for pull requests, including ones from forks, but with the base repository's secrets and a token that can write.
 - A **force push** replaces history on a branch or moves a tag, instead of adding new commits on top.
+- A **VS Code task** is a command saved in `.vscode/tasks.json` so you can run it from the editor. With `"runOptions": { "runOn": "folderOpen" }` it runs by itself when the folder opens, before you've read any code. Some projects use that to start a file watcher, which is why a plain auto-run task is only medium. If yours is one of those, accept it in `devsweep.config.json`: the `subject` is the task's `label`. devsweep reads `tasks.json` at the root of the folder you scan, and never runs anything in it. Findings describe what the task does instead of quoting its command. To protect yourself in every folder, set `"task.allowAutomaticTasks": "off"` in your own VS Code user settings.
+- **PolinRider** is a malware campaign that plants a small hidden loader in repositories: at the end of build config files such as `tailwind.config.js`, after a long run of spaces so it's off-screen; in fake font files that are really JavaScript; and in VS Code tasks that run when the folder opens. Infected machines then spread it by force-pushing to every repository they can write to. The four `code/*` rules above look for those signs. They read every text file in the project (skipping `node_modules`, the inside of `.git`, build tools' generated folders, and text files over 8 MiB, which are named in a warning), read only the first bytes of font files, and never run anything. Findings describe what was found ("438 spaces, then 31,302 characters of code at column 120") and never quote it, and `--details` doesn't show the line either, since it may be malware.
+- **The marker list** for `code/known-marker` comes from [meSingh/polinrider-scanner](https://github.com/meSingh/polinrider-scanner) (MIT license, copyright Mandeep Singh), and each entry links to its source line. It is bundled, so it works offline and nobody can change it at run time. The campaign changes its markers every few weeks, so the list is refreshed with releases; `code/hidden-padding` is the rule that catches variants nobody has published yet.
 
 ### GitHub repository checks
 

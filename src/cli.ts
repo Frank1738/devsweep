@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { Command, CommanderError, Option } from 'commander';
+import { Command, CommanderError, Help, Option } from 'commander';
 import pc from 'picocolors';
 import { ConfigError } from './config.js';
 import { errorMessage } from './errors.js';
@@ -9,20 +9,25 @@ import {
   EXIT_OK,
   EXIT_TOOL_ERROR,
   exitCodeFor,
+  exitCodeForAll,
   FAIL_ON,
   type FailOn,
 } from './exit-code.js';
+import { count, list } from './format.js';
 import { findRepository } from './git.js';
-import { formatJson } from './reporters/json.js';
-import { formatPretty } from './reporters/pretty.js';
+import { formatJson, formatJsonAll } from './reporters/json.js';
+import { ALL_OFFLINE_NOTE, formatPretty, formatPrettyAll } from './reporters/pretty.js';
 import { formatSarif } from './reporters/sarif.js';
 import { type ReadLines, sourceReader } from './reporters/source.js';
+import { type ScanAllProgress, scanAll } from './scan-all.js';
 import { ScanTargetError, scan } from './scanner.js';
 import type { Env, ScanResult } from './types.js';
 import { bannerFits, playBanner, renderBanner } from './ui/banner.js';
+import { type Progress, startProgress } from './ui/progress.js';
 import { startSweep } from './ui/sweep.js';
 import { printable, sleep } from './ui/terminal.js';
 import { VERSION } from './version.js';
+import { PROJECT_MARKERS } from './walk.js';
 
 export interface Io {
   stdout(text: string): void;
@@ -47,6 +52,8 @@ interface ScanFlags {
   output?: string;
   details?: boolean;
   offline?: boolean;
+  /** Find every project under the path and scan each one. */
+  all?: boolean;
   /** False when --no-color is passed. */
   color?: boolean;
 }
@@ -95,77 +102,27 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
       'save the --json or --sarif report to a file, and show the readable report',
     )
     .option('--offline', 'skip the checks that call the GitHub API')
+    .option(
+      '--all',
+      `find every project under the path (folders with ${list(PROJECT_MARKERS, 'or')}) and scan each one, offline`,
+    )
     .option('--no-color', 'turn off colors');
+
+  showDefaultCommandInHelp(program, scanCommand);
 
   scanCommand.action(async (target: string, flags: ScanFlags) => {
     const machine = machineFormat(flags);
     if (flags.output !== undefined && !machine) {
       scanCommand.error('error: --output needs --json or --sarif');
     }
-    // The readable report shows unless a machine format is going to stdout.
-    const readable = !machine || flags.output !== undefined;
-    const color = io.color && flags.color !== false;
-    const animate = io.interactive && readable;
-    const banner = animate && bannerFits(io.width);
-    const shownTarget = displayTarget(target);
-
-    // Start scanning right away, so the work overlaps the animations.
-    let scanned = false;
-    const scanning = settle(
-      scan({ root: target, offline: flags.offline ?? false, env: io.env, fetch: io.fetch }),
-    ).finally(() => {
-      scanned = true;
-    });
-    if (banner) await playBanner(io.stdout, { color, version: VERSION, width: io.width });
-    // The sweep shows progress, so skip it when the scan finished while the banner drew.
-    const stopSweep =
-      animate && !(banner && scanned)
-        ? startSweep({ write: io.stdout, label: shownTarget, color, width: io.width })
-        : undefined;
-    const outcome = await scanning;
-    await stopSweep?.();
-
-    if (!outcome.ok) {
-      if (!isSetupError(outcome.error)) throw outcome.error;
-      // A config error can quote the scanned repository's config file.
-      io.stderr(`devsweep: ${printable(outcome.error.message)}\n`);
-      exitCode = EXIT_TOOL_ERROR;
-      return;
+    if (flags.all && machine === 'sarif') {
+      scanCommand.error(
+        "error: --sarif can't be used with --all: a SARIF report describes one repository, for that repository's Security tab. Use --json, or scan each repository on its own.",
+      );
     }
-    const result = outcome.value;
-    const readLines = sourceReader(result.root);
-
-    if (machine) {
-      const report = await formatMachine(machine, result, readLines);
-      if (flags.output === undefined) {
-        io.stdout(report);
-      } else {
-        const failure = await saveReport(flags.output, report);
-        if (failure) {
-          io.stderr(`devsweep: ${failure}\n`);
-          exitCode = EXIT_TOOL_ERROR;
-          return;
-        }
-      }
-    }
-
-    if (readable) {
-      let report = formatPretty(result, {
-        target: shownTarget,
-        color,
-        showName: !banner,
-        details: flags.details,
-        width: io.width,
-        readLines,
-      });
-      if (machine && flags.output !== undefined) {
-        const name = machine === 'sarif' ? 'SARIF' : 'JSON';
-        report += `  ${pc.createColors(color).dim(`${name} report saved to ${flags.output}`)}\n`;
-      }
-      if (animate) await reveal(io, report);
-      else io.stdout(report);
-    }
-    exitCode = exitCodeFor(result, flags.failOn);
+    exitCode = flags.all
+      ? await runAll(target, flags, machine, io)
+      : await runOne(target, flags, machine, io);
   });
 
   try {
@@ -177,6 +134,222 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
     throw error;
   }
   return exitCode;
+}
+
+/** `devsweep <path>`: scans one repository. Returns the exit code. */
+async function runOne(
+  target: string,
+  flags: ScanFlags,
+  machine: MachineFormat | undefined,
+  io: Io,
+): Promise<number> {
+  // The readable report shows unless a machine format is going to stdout.
+  const readable = !machine || flags.output !== undefined;
+  const color = io.color && flags.color !== false;
+  const animate = io.interactive && readable;
+  const banner = animate && bannerFits(io.width);
+  const shownTarget = displayTarget(target);
+
+  const result = await runJob(
+    scan({ root: target, offline: flags.offline ?? false, env: io.env, fetch: io.fetch }),
+    io,
+    color,
+    banner,
+    animate
+      ? () => startSweep({ write: io.stdout, label: shownTarget, color, width: io.width })
+      : undefined,
+  );
+  if (!result) return EXIT_TOOL_ERROR;
+
+  const readLines = sourceReader(result.root);
+  const saved = await emit(io, flags, color, animate, {
+    machine: machine && { format: machine, text: await formatMachine(machine, result, readLines) },
+    readable:
+      readable &&
+      (() =>
+        formatPretty(result, {
+          target: shownTarget,
+          color,
+          showName: !banner,
+          details: flags.details,
+          width: io.width,
+          readLines,
+        })),
+  });
+  return saved ? exitCodeFor(result, flags.failOn) : EXIT_TOOL_ERROR;
+}
+
+/**
+ * `devsweep <path> --all`: finds every project under the path and scans each one, offline.
+ * Returns the exit code.
+ */
+async function runAll(
+  target: string,
+  flags: ScanFlags,
+  machine: MachineFormat | undefined,
+  io: Io,
+): Promise<number> {
+  const readable = !machine || flags.output !== undefined;
+  const color = io.color && flags.color !== false;
+  // Progress and animation only for a person reading the readable report: never with --json.
+  const animate = io.interactive && !machine;
+  const banner = animate && bannerFits(io.width);
+  const shownTarget = displayTarget(target);
+
+  // Progress arrives once per folder searched; it is only put into words when the line redraws.
+  let latest: ScanAllProgress | undefined;
+  let progress: Progress | undefined;
+  const all = await runJob(
+    scanAll({
+      root: target,
+      env: io.env,
+      onProgress: (p) => {
+        latest = p;
+        progress?.update();
+      },
+    }),
+    io,
+    color,
+    banner,
+    animate
+      ? () => {
+          progress = startProgress({
+            write: io.stdout,
+            text: () => (latest ? describeProgress(latest) : `searching ${shownTarget}`),
+            color,
+            width: io.width,
+          });
+          return progress.stop;
+        }
+      : undefined,
+  );
+  if (!all) return EXIT_TOOL_ERROR;
+
+  const saved = await emit(io, flags, color, animate, {
+    machine: machine && { format: machine, text: formatJsonAll(all, VERSION) },
+    // The readable report carries this note; without it, say it on stderr, away from the JSON.
+    note: ALL_OFFLINE_NOTE,
+    readable:
+      readable &&
+      (() =>
+        formatPrettyAll(all, {
+          target: shownTarget,
+          color,
+          showName: !banner,
+          details: flags.details,
+          width: io.width,
+          readerFor: sourceReader,
+        })),
+  });
+  return saved ? exitCodeForAll(all, flags.failOn) : EXIT_TOOL_ERROR;
+}
+
+/**
+ * Runs a scan while the banner plays, then shows `indicator` (a spinner or progress line) until
+ * the scan is done. Returns undefined after printing why when the scan couldn't start.
+ */
+async function runJob<T>(
+  job: Promise<T>,
+  io: Io,
+  color: boolean,
+  banner: boolean,
+  indicator: (() => () => unknown) | undefined,
+): Promise<T | undefined> {
+  // Start right away, so the work overlaps the animations.
+  let finished = false;
+  const running = settle(job).finally(() => {
+    finished = true;
+  });
+  if (banner) await playBanner(io.stdout, { color, version: VERSION, width: io.width });
+  // The indicator shows progress, so skip it when the scan finished while the banner drew.
+  const stop = indicator && !(banner && finished) ? indicator() : undefined;
+  const outcome = await running;
+  await stop?.();
+
+  if (outcome.ok) return outcome.value;
+  if (!isSetupError(outcome.error)) throw outcome.error;
+  // A config error can quote the scanned repository's config file.
+  io.stderr(`devsweep: ${printable(outcome.error.message)}
+`);
+  return undefined;
+}
+
+interface Reports {
+  /** The --json or --sarif report, when one was asked for. */
+  machine: { format: MachineFormat; text: string } | undefined;
+  /** Printed on stderr when the machine report goes to stdout and no readable report shows. */
+  note?: string;
+  /** Builds the readable report, when it shows. */
+  readable: false | (() => string);
+}
+
+/**
+ * Prints or saves the machine report, then shows the readable one. Returns false when the
+ * report couldn't be saved.
+ */
+async function emit(
+  io: Io,
+  flags: ScanFlags,
+  color: boolean,
+  animate: boolean,
+  reports: Reports,
+): Promise<boolean> {
+  const { machine } = reports;
+  if (machine) {
+    if (flags.output === undefined) {
+      io.stdout(machine.text);
+      if (reports.note)
+        io.stderr(`devsweep: ${reports.note}
+`);
+    } else {
+      const failure = await saveReport(flags.output, machine.text);
+      if (failure) {
+        io.stderr(`devsweep: ${failure}
+`);
+        return false;
+      }
+    }
+  }
+
+  if (reports.readable) {
+    let report = reports.readable();
+    if (machine && flags.output !== undefined) {
+      const name = machine.format === 'sarif' ? 'SARIF' : 'JSON';
+      report += `  ${pc.createColors(color).dim(`${name} report saved to ${flags.output}`)}
+`;
+    }
+    if (animate) await reveal(io, report);
+    else io.stdout(report);
+  }
+  return true;
+}
+
+function describeProgress(progress: ScanAllProgress): string {
+  if (progress.stage === 'searching') {
+    return `searching  ${count(progress.folders)} folders · ${count(progress.projects)} projects found`;
+  }
+  return `scanning ${count(progress.done + 1)} of ${count(progress.total)}  ${progress.project}`;
+}
+
+/**
+ * `devsweep --help` lists the default command's argument and options too, since they work
+ * without naming the command. Commander shows only the program's own by default.
+ */
+function showDefaultCommandInHelp(program: Command, command: Command): void {
+  program.usage('[options] [path]').configureHelp({
+    visibleArguments(cmd) {
+      return Help.prototype.visibleArguments.call(this, cmd === program ? command : cmd);
+    },
+    visibleOptions(cmd) {
+      const own = Help.prototype.visibleOptions.call(this, cmd);
+      if (cmd !== program) return own;
+      // The command's own help option would repeat the program's.
+      const borrowed = Help.prototype.visibleOptions
+        .call(this, command)
+        .filter((option) => option.long !== '--help');
+      return [...borrowed, ...own];
+    },
+  });
 }
 
 type Outcome<T> = { ok: true; value: T } | { ok: false; error: unknown };

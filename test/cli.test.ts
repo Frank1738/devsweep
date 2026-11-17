@@ -87,6 +87,53 @@ describe('devsweep scan', () => {
     expect(lastLines(stdout, 1)[0]).toMatch(/^ {2}● No issues found {2}· \d+ ms$/);
   });
 
+  it('says there was nothing to scan, and what it looked for, in a folder without those files', async () => {
+    // Any text file counts as something to scan, so this needs a folder with no files at all.
+    const empty = await mkdtemp(path.join(os.tmpdir(), 'devsweep-empty-'));
+    try {
+      const { code, stdout } = await run('scan', empty);
+      expect(code).toBe(EXIT_OK);
+      expect(stdout).not.toContain('No issues found');
+      expect(lastLines(stdout, 3)).toEqual([
+        expect.stringMatching(/^ {2}● Nothing to scan {2}· \d+ ms$/),
+        '  devsweep looks for .github/workflows/*.yml, .github/workflows/*.yaml, .vscode/tasks.json and text',
+        '  files, and found none here.',
+      ]);
+    } finally {
+      await rm(empty, { recursive: true, force: true });
+    }
+  });
+
+  it('counts a folder with only a README as scanned, since the code rules read it', async () => {
+    const { code, stdout } = await run('scan', fixture('no-workflows'));
+    expect(code).toBe(EXIT_OK);
+    expect(lastLines(stdout, 1)[0]).toMatch(/^ {2}● No issues found {2}· \d+ ms$/);
+  });
+
+  it('wraps warnings to fit a narrow terminal, keeping the end of the message', async () => {
+    let stdout = '';
+    await main([fixture('clean-repo')], {
+      stdout: (text) => {
+        stdout += text;
+      },
+      stderr: () => {},
+      color: false,
+      interactive: false,
+      width: 40,
+      env: {},
+      fetch: () => Promise.reject(new Error('no network in tests')),
+    });
+    const lines = stdout.split('\n');
+    const from = lines.findIndex((line) => line.startsWith('  ! '));
+    const warning = lines.slice(from, lines.indexOf('', from));
+    expect(warning.length).toBeGreaterThan(1);
+    expect(warning.filter((line) => line.length > 40)).toEqual([]);
+    expect(warning.slice(1).every((line) => line.startsWith('    '))).toBe(true);
+    expect(warning.map((line) => line.slice(4)).join(' ')).toMatch(
+      /^Couldn't check GitHub repository settings .* Set GITHUB_TOKEN or GH_TOKEN .* Pass --offline to skip these checks\.$/,
+    );
+  });
+
   it('shows skipped files, and counts them as warnings in the summary', async () => {
     const { stdout } = await run('scan', fixture('invalid-yaml'));
     expect(stdout).toContain('  ! .github/workflows/broken.yml  Skipped invalid YAML');
@@ -346,6 +393,20 @@ describe('devsweep scan --fail-on and exit codes', () => {
     expect(code).toBe(EXIT_OK);
     expect(stdout).toContain('--fail-on <severity>');
   });
+
+  it("lists scan's argument and options in the top-level --help, since scan is the default", async () => {
+    const { code, stdout } = await run('--help');
+    expect(code).toBe(EXIT_OK);
+    expect(stdout).toContain('Usage: devsweep [options] [path]');
+    expect(stdout).toMatch(/^ {2}path +directory to scan/m);
+    for (const option of ['--details', '--fail-on <severity>', '--json', '--sarif', '--output']) {
+      expect(stdout).toContain(option);
+    }
+    expect(stdout).toContain('--offline');
+    expect(stdout).toContain('--version');
+    expect(stdout.match(/--help/g)).toHaveLength(1);
+    expect(stdout).toMatch(/^ {2}scan \[options\] \[path\]/m);
+  });
 });
 
 describe('devsweep scan with devsweep.config.json', () => {
@@ -364,8 +425,8 @@ describe('devsweep scan with devsweep.config.json', () => {
     expect(code).toBe(EXIT_FINDINGS);
     expect(stdout).not.toContain('setup-tool');
     expect(stdout).toContain(
-      '  ! devsweep.config.json  accept[2] matches no finding (workflow/force-push in ' +
-        '.github/workflows/pages.yml). Remove it if the issue was fixed.',
+      '  ! devsweep.config.json  accept[2] matches no finding (workflow/force-push in\n' +
+        '    .github/workflows/pages.yml). Remove it if the issue was fixed.\n',
     );
     expect(lastLines(stdout, 2)[0]).toMatch(
       /^ {2}2 issues {2}1 high {2}1 low {2}· 2 accepted {2}· 1 warning {2}· \d+ ms$/,
@@ -470,6 +531,23 @@ describe('devsweep scan: GitHub repository checks', () => {
     expect(code).toBe(EXIT_OK);
     expect(stdout).toContain("  ! Couldn't check GitHub repository settings");
     expect(lastLines(stdout, 1)[0]).toMatch(/No issues found {2}· 1 warning {2}· \d+ ms$/);
+  });
+
+  it('says only the GitHub settings were checked when there were no files to scan', async () => {
+    const { fetch } = fakeGitHub(protectedRepo());
+    const { code, stdout } = await runOnline(['scan', clone], env, fetch);
+    expect(code).toBe(EXIT_OK);
+    expect(lastLines(stdout, 3)).toEqual([
+      expect.stringMatching(/^ {2}● No issues found {2}· \d+ ms$/),
+      '  Only the GitHub repository settings were checked. devsweep looks for .github/workflows/*.yml,',
+      '  .github/workflows/*.yaml, .vscode/tasks.json and text files, and found none here.',
+    ]);
+  });
+
+  it('says there was nothing to scan when the GitHub settings could not be read either', async () => {
+    const { code, stdout } = await runOnline(['scan', clone], {});
+    expect(code).toBe(EXIT_OK);
+    expect(stdout).toMatch(/● Nothing to scan {2}· 1 warning {2}· \d+ ms\n/);
   });
 
   it('lists repository findings under their own heading, and fails on them', async () => {

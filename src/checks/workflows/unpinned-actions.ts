@@ -25,13 +25,19 @@ export const rules = [unpinnedAction] as const;
 const GITHUB_OWNED = new Set(['actions', 'github']);
 const FULL_SHA = /^[0-9a-f]{40}$/i;
 
-export function analyze(workflow: Workflow): Finding[] {
+/** Facts about the scanned repository that change how findings are worded. */
+export interface WorkflowContext {
+  /** The repository's owner on GitHub (a user or organisation), when known. */
+  owner?: string | undefined;
+}
+
+export function analyze(workflow: Workflow, context: WorkflowContext = {}): Finding[] {
   const references = workflow.jobs.flatMap((job) => [
     ...(job.uses ? [job.uses] : []),
     ...job.steps.flatMap((step) => (step.uses ? [step.uses] : [])),
   ]);
   return references.flatMap((uses) => {
-    const problem = describeProblem(uses.value);
+    const problem = describeProblem(uses.value, context.owner);
     return problem ? [finding(workflow, uses, problem)] : [];
   });
 }
@@ -41,7 +47,7 @@ interface Problem {
   remediation: string;
 }
 
-function describeProblem(uses: string): Problem | undefined {
+function describeProblem(uses: string, repoOwner: string | undefined): Problem | undefined {
   if (uses.startsWith('./')) return undefined;
 
   if (uses.startsWith('docker://')) {
@@ -58,10 +64,16 @@ function describeProblem(uses: string): Problem | undefined {
   const owner = name.split('/')[0]?.toLowerCase() ?? '';
   if (GITHUB_OWNED.has(owner) || FULL_SHA.test(ref)) return undefined;
 
+  // Still worth pinning: a stolen token with write access to that repository can move its tags.
+  // GitHub owner names ignore case.
+  const own = repoOwner !== undefined && owner === repoOwner.toLowerCase();
+  const label = own
+    ? `Action "${name}" is your organisation's own, but it`
+    : `Third-party action "${name}"`;
   return {
     message: ref
-      ? `Third-party action "${name}" is pinned to "${ref}", a tag or branch its owner can move.`
-      : `Third-party action "${name}" has no version, so it can change at any time.`,
+      ? `${label} is pinned to "${ref}", a tag or branch ${own ? 'anyone with write access to it' : 'its owner'} can move.`
+      : `${label} has no version, so it can change at any time.`,
     remediation: `Pin it to a full commit SHA: uses: ${name}@<40-character-sha>${ref ? ` # ${ref}` : ''}`,
   };
 }

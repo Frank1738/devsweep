@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { refPatternMatches } from '../src/checks/repo/api.js';
 import { repoCheck } from '../src/checks/repo/index.js';
+import { findGitHubRepository } from '../src/github/repository.js';
 import type { Env, ScanContext } from '../src/types.js';
 import { BASE, fakeGitHub, protectedRepo, Reply } from './fake-github.js';
 
@@ -33,6 +34,9 @@ async function check(
   const ctx: ScanContext = {
     root: temp,
     warn: (message) => warnings.push(message),
+    scannedFile: () => {},
+    scannedGitHub: () => {},
+    repository: () => findGitHubRepository(temp, env),
     offline,
     env,
     fetch: wrap(github.fetch),

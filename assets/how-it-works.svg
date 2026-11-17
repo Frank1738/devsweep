@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420" role="img" aria-labelledby="title">
-<title id="title">How devsweep works. It reads workflow files from the folder you scan, and repository settings from the GitHub API (this needs a token and is skipped with --offline). It runs 8 rules, 6 for workflows and 2 for repository settings, adjusted by devsweep.config.json. It gives back a readable report, an exit code (0 pass, 1 findings, 2 error), JSON with --json, and SARIF with --sarif for the GitHub Security tab.</title>
+<title id="title">How devsweep works. It reads workflow files, .vscode/tasks.json and every other text file from the folder you scan, and repository settings from the GitHub API (this needs a token and is skipped with --offline). It runs 13 rules, 6 for workflows, 5 for planted code and 2 for repository settings, adjusted by devsweep.config.json. It gives back a readable report, an exit code (0 pass, 1 findings, 2 error), JSON with --json, and SARIF with --sarif for the GitHub Security tab.</title>
 <style>
 text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;fill:#8b949e;font-size:12.5px}
 .mono{font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;font-size:12px}
@@ -31,25 +31,27 @@ text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,san
 <text class="head" x="622" y="56">WHAT YOU GET</text>
 
 <!-- Inputs -->
-<rect class="box" x="48" y="72" width="250" height="96" rx="8"/>
-<text class="name" x="66" y="100">Workflow files</text>
+<rect class="box" x="48" y="72" width="250" height="116" rx="8"/>
+<text class="name" x="66" y="100">Files in the folder you scan</text>
 <text class="mono" x="66" y="124" fill="#c9d1d9">.github/workflows/*.yml</text>
-<text x="66" y="148">Read from the folder you scan</text>
+<text class="mono" x="66" y="144" fill="#c9d1d9">.vscode/tasks.json</text>
+<text x="66" y="168">and every other text file</text>
 
-<rect class="box" x="48" y="188" width="250" height="136" rx="8"/>
-<text class="name" x="66" y="216">Repository settings on GitHub</text>
-<text x="66" y="240">Rulesets, branch protection and</text>
-<text x="66" y="258">recent force pushes</text>
-<text x="66" y="286">Read through the GitHub API with</text>
-<text x="66" y="304">a token. <tspan class="mono" fill="#c9d1d9">--offline</tspan> skips them.</text>
+<rect class="box" x="48" y="204" width="250" height="136" rx="8"/>
+<text class="name" x="66" y="232">Repository settings on GitHub</text>
+<text x="66" y="256">Rulesets, branch protection and</text>
+<text x="66" y="274">recent force pushes</text>
+<text x="66" y="302">Read through the GitHub API with</text>
+<text x="66" y="320">a token. <tspan class="mono" fill="#c9d1d9">--offline</tspan> skips them.</text>
 
 <!-- devsweep -->
 <rect x="360" y="112" width="200" height="150" rx="10" fill="#56d4dd" opacity=".16" filter="url(#glow)"/>
 <rect x="360" y="112" width="200" height="150" rx="10" fill="#121a22" stroke="#56d4dd" stroke-opacity=".75"/>
 <text class="mono" x="460" y="160" text-anchor="middle" font-size="22" font-weight="700" fill="url(#word)" style="font-size:22px">devsweep</text>
-<text class="name" x="460" y="194" text-anchor="middle">8 rules</text>
-<text x="460" y="216" text-anchor="middle">6 for workflows</text>
-<text x="460" y="234" text-anchor="middle">2 for repository settings</text>
+<text class="name" x="460" y="188" text-anchor="middle">13 rules</text>
+<text x="460" y="210" text-anchor="middle">6 for workflows</text>
+<text x="460" y="228" text-anchor="middle">5 for planted code</text>
+<text x="460" y="246" text-anchor="middle">2 for repository settings</text>
 
 <rect class="box" x="360" y="300" width="200" height="72" rx="8" stroke-dasharray="4 3"/>
 <text class="mono" x="460" y="326" text-anchor="middle" fill="#c9d1d9">devsweep.config.json</text>
@@ -74,8 +76,8 @@ text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,san
 <text x="640" y="327"><tspan class="mono" fill="#c9d1d9">--sarif</tspan>, for GitHub's Security tab</text>
 
 <!-- Wires -->
-<path class="wire" d="M298 120C330 120 330 162 358 162" marker-end="url(#arrow)"/>
-<path class="wire" d="M298 256C330 256 330 214 358 214" marker-end="url(#arrow)"/>
+<path class="wire" d="M298 130C330 130 330 162 358 162" marker-end="url(#arrow)"/>
+<path class="wire" d="M298 272C330 272 330 214 358 214" marker-end="url(#arrow)"/>
 <path class="wire" d="M460 300V265" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
 <path class="wire" d="M560 170C592 170 590 101 620 101" marker-end="url(#arrow)"/>
 <path class="wire" d="M560 182C592 182 590 171 620 171" marker-end="url(#arrow)"/>

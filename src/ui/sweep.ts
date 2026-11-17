@@ -1,5 +1,5 @@
 import pc from 'picocolors';
-import { CLEAR_LINE, hideCursor, sleep } from './terminal.js';
+import { CLEAR_LINE, fitWidth, hideCursor, sleep } from './terminal.js';
 
 /** Width of the track the broom sweeps across, in columns. */
 const TRACK = 24;
@@ -32,7 +32,7 @@ export function startSweep(options: SweepOptions): () => Promise<void> {
   const c = pc.createColors(options.color);
   const passMs = options.passMs ?? 400;
   const started = Date.now();
-  const label = shorten(options.label, options.width);
+  const label = fitWidth(options.label, options.width, PREFIX, 'end');
 
   const draw = (progress: number) => {
     const head = Math.round(progress * (TRACK + HEAD));
@@ -58,11 +58,4 @@ export function startSweep(options: SweepOptions): () => Promise<void> {
     options.write(CLEAR_LINE);
     restoreCursor();
   };
-}
-
-function shorten(label: string, width: number | undefined): string {
-  if (width === undefined) return label;
-  const room = width - PREFIX - 1;
-  if (room < 4) return '';
-  return label.length > room ? `…${label.slice(label.length - room + 1)}` : label;
 }

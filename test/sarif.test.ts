@@ -48,6 +48,21 @@ describe('formatSarif', () => {
     await expect(sarif).toMatchFileSnapshot('./golden/vulnerable-repo.sarif');
   });
 
+  it('lists every PolinRider rule, even when none of them found anything', () => {
+    const ids = toSarif(result([]), { version: VERSION }).runs[0].tool.driver.rules.map(
+      (rule) => rule.id,
+    );
+    expect(ids).toEqual(
+      expect.arrayContaining([
+        'code/autorun-task',
+        'code/hidden-padding',
+        'code/disguised-file',
+        'code/propagation-script',
+        'code/known-marker',
+      ]),
+    );
+  });
+
   it('describes every rule once, in a fixed order, with the fields GitHub requires', () => {
     const { driver } = toSarif(result([]), { version: VERSION }).runs[0].tool;
     expect(driver).toMatchObject({ name: 'devsweep', semanticVersion: VERSION });

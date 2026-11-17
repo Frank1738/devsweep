@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { workflowsCheck } from '../../src/checks/workflows/index.js';
+import { findGitHubRepository } from '../../src/github/repository.js';
 import type { ScanContext } from '../../src/types.js';
 
 /** Absolute paths that fail to read, as if access were denied. */
@@ -51,6 +52,9 @@ function context() {
   const ctx: ScanContext = {
     root: temp,
     warn: (message, file) => warnings.push({ file, message }),
+    scannedFile: () => {},
+    scannedGitHub: () => {},
+    repository: () => findGitHubRepository(temp, {}),
     offline: true,
     env: {},
     fetch: globalThis.fetch,

@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CONFIG_FILE, type Config } from '../src/config.js';
 import { compareFindings, ScanTargetError, scan } from '../src/scanner.js';
 import type { Check, Finding, Rule, ScanResult } from '../src/types.js';
@@ -29,9 +32,49 @@ describe('scan', () => {
     expect(result.findings).toEqual([]);
   });
 
+  it('finds tasks that run when the folder opens, at their runOn key', async () => {
+    const result = await scan({ root: fixture('autorun-task'), offline: true });
+    expect(
+      result.findings.map((f) => `${f.severity} ${f.ruleId} ${f.file}:${f.line}:${f.column}`),
+    ).toEqual([
+      'critical code/autorun-task .vscode/tasks.json:18:9',
+      'medium code/autorun-task .vscode/tasks.json:10:23',
+    ]);
+    expect(result.findings[0]?.message).toBe(
+      'Task "Install" runs automatically when the folder opens, and runs node on a font file, ' +
+        "hides its terminal and doesn't show the command it runs.",
+    );
+    expect(result).toMatchObject({ warnings: [], errors: [] });
+  });
+
   it('reports nothing for a repository without workflows', async () => {
     const result = await scan({ root: fixture('no-workflows'), offline: true });
     expect(result).toMatchObject({ findings: [], warnings: [], errors: [] });
+  });
+
+  it('records that it found no files to read, and what it looked for', async () => {
+    const empty = await mkdtemp(path.join(os.tmpdir(), 'devsweep-empty-'));
+    try {
+      const result = await scan({ root: empty, offline: true });
+      expect(result.coverage).toEqual({
+        filesRead: false,
+        lookedFor: [
+          '.github/workflows/*.yml',
+          '.github/workflows/*.yaml',
+          '.vscode/tasks.json',
+          'text files',
+        ],
+        github: false,
+      });
+    } finally {
+      await rm(empty, { recursive: true, force: true });
+    }
+  });
+
+  it('records that it read files, including ones skipped as invalid', async () => {
+    for (const name of ['no-workflows', 'invalid-yaml', 'autorun-task']) {
+      expect((await scan({ root: fixture(name), offline: true })).coverage?.filesRead).toBe(true);
+    }
   });
 
   it('skips invalid YAML with a warning instead of failing', async () => {
@@ -195,6 +238,49 @@ describe('scan: acceptances that match no finding', () => {
       ),
     });
     expect(unused(result)).toEqual(['accept[1]']);
+  });
+});
+
+describe("scan: the organisation's own actions", () => {
+  let temp: string;
+
+  beforeEach(async () => {
+    temp = await mkdtemp(path.join(os.tmpdir(), 'devsweep-own-actions-'));
+    await mkdir(path.join(temp, '.github', 'workflows'), { recursive: true });
+    await writeFile(
+      path.join(temp, '.github', 'workflows', 'ci.yml'),
+      'on: push\npermissions: {}\njobs:\n  build:\n    steps:\n      - uses: octo/deploy@v1\n',
+    );
+  });
+
+  afterEach(async () => {
+    await rm(temp, { recursive: true, force: true });
+  });
+
+  async function message(env: Record<string, string> = {}) {
+    const result = await scan({ root: temp, offline: true, env });
+    expect(result.findings).toHaveLength(1);
+    return result.findings[0]?.message;
+  }
+
+  it('finds the owner from the git remote, with no network', async () => {
+    await mkdir(path.join(temp, '.git'));
+    await writeFile(
+      path.join(temp, '.git', 'config'),
+      '[remote "origin"]\n\turl = git@github.com:octo/demo.git\n',
+    );
+    expect(await message({ GITHUB_REPOSITORY: 'someone-else/repo' })).toMatch(
+      /^Action "octo\/deploy" is your organisation's own/,
+    );
+  });
+
+  it('falls back to GITHUB_REPOSITORY without a GitHub remote', async () => {
+    await mkdir(path.join(temp, '.git'));
+    await writeFile(path.join(temp, '.git', 'config'), '[core]\n');
+    expect(await message({ GITHUB_REPOSITORY: 'octo/demo' })).toMatch(
+      /^Action "octo\/deploy" is your organisation's own/,
+    );
+    expect(await message({ GITHUB_REPOSITORY: 'other/demo' })).toMatch(/^Third-party action/);
   });
 });
 

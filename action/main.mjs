@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import childProcess from "node:child_process";
@@ -3218,6 +3218,11 @@ function allowKeys(value, keys, where) {
 function errorMessage(error) {
 	return error instanceof Error ? error.message : String(error);
 }
+/** True when a file system error means the path doesn't exist. */
+function isMissing(error) {
+	const code = error?.code;
+	return code === "ENOENT" || code === "ENOTDIR";
+}
 const FAIL_ON = [...SEVERITIES, "none"];
 /** The findings at or above `failOn`. */
 function failingFindings(findings, failOn) {
@@ -3232,6 +3237,26 @@ function failingFindings(findings, failOn) {
 function exitCodeFor(result, failOn) {
 	if (result.errors.length > 0) return 2;
 	return failingFindings(result.findings, failOn).length > 0 ? 1 : 0;
+}
+/** The worst exit code across every project: a crashed check (2), then findings (1). */
+function exitCodeForAll(all, failOn) {
+	const codes = all.projects.map((project) => exitCodeFor(project.result, failOn));
+	if (codes.includes(2)) return 2;
+	return codes.includes(1) ? 1 : 0;
+}
+// src/format.ts
+/** 31302 → "31,302". The same on every machine, whatever its language settings. */
+function count(n) {
+	return n.toLocaleString("en-US");
+}
+/** "1 line", "3 lines". */
+function plural(n, word) {
+	return `${count(n)} ${word}${n === 1 ? "" : "s"}`;
+}
+/** "a", "a and b", "a, b and c"; or "a, b or c". */
+function list(items, last = "and") {
+	if (items.length <= 1) return items.join("");
+	return `${items.slice(0, -1).join(", ")} ${last} ${items.at(-1)}`;
 }
 // src/git.ts
 /**
@@ -3275,6 +3300,42 @@ function formatJson(result, version) {
 			name: "devsweep",
 			version
 		},
+		...resultFields(result)
+	};
+	return `${JSON.stringify(report, null, 2)}\n`;
+}
+/**
+* The `--all` report: totals, then each project's results in the same shape as a single scan's
+* report. The shape is part of the public interface: only add fields.
+*/
+function formatJsonAll(all, version) {
+	const results = all.projects.map((project) => project.result);
+	const report = {
+		tool: {
+			name: "devsweep",
+			version
+		},
+		root: all.root,
+		durationMs: all.durationMs,
+		offline: true,
+		summary: {
+			projects: all.projects.length,
+			projectsWithFindings: results.filter((r) => r.findings.length > 0).length,
+			foldersSearched: all.foldersSearched,
+			foldersUnreadable: all.unreadable.length,
+			...summarize(results.flatMap((r) => r.findings)),
+			accepted: results.reduce((sum, r) => sum + r.accepted.length, 0)
+		},
+		unreadable: all.unreadable,
+		projects: all.projects.map((project) => ({
+			path: project.path,
+			...resultFields(project.result)
+		}))
+	};
+	return `${JSON.stringify(report, null, 2)}\n`;
+}
+function resultFields(result) {
+	return {
 		root: result.root,
 		durationMs: result.durationMs,
 		summary: {
@@ -3286,7 +3347,1737 @@ function formatJson(result, version) {
 		warnings: result.warnings,
 		errors: result.errors
 	};
-	return `${JSON.stringify(report, null, 2)}\n`;
+}
+// src/compare.ts
+/**
+* Orders text by character code, so "B" comes before "a". Unlike localeCompare, the result
+* doesn't depend on the language settings of the machine.
+*/
+function compareText(a, b) {
+	if (a < b) return -1;
+	return a > b ? 1 : 0;
+}
+// src/concurrency.ts
+/**
+* Calls `work` on every item, with at most `limit` calls running at once, and returns the
+* results in the same order as `items`. Like Promise.all, but without opening thousands of
+* files at the same moment.
+*/
+async function mapLimit(items, limit, work) {
+	const results = new Array(items.length);
+	let next = 0;
+	const worker = async () => {
+		while (next < items.length) {
+			const index = next++;
+			results[index] = await work(items[index], index);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+	return results;
+}
+/**
+* A gate that lets at most `limit` tasks run at once, across every caller that shares it. Unlike
+* mapLimit, tasks can be added while others run, such as files found while a folder is listed.
+*/
+function limiter(limit) {
+	let active = 0;
+	const waiting = [];
+	return async (task) => {
+		while (active >= limit) await new Promise((resolve) => waiting.push(resolve));
+		active++;
+		try {
+			return await task();
+		} finally {
+			active--;
+			waiting.shift()?.();
+		}
+	};
+}
+// src/walk.ts
+/** Never searched, at any depth: installed packages and git's own database. */
+const SKIPPED_ANYWHERE = /* @__PURE__ */ new Set([
+	"node_modules",
+	".git",
+	"appdata"
+]);
+/**
+* Windows system folders, skipped only directly under a drive root such as C:\. Deeper down
+* these names are ordinary: Flutter projects have their own `windows` folder, for example.
+*/
+const SKIPPED_AT_DRIVE_ROOT = /* @__PURE__ */ new Set([
+	"windows",
+	"program files",
+	"program files (x86)",
+	"programdata",
+	"$recycle.bin",
+	"system volume information"
+]);
+/**
+* What makes a folder a project, as shown to the user. `findProjects` checks for exactly these.
+*/
+const PROJECT_MARKERS = [
+	".git",
+	".github/workflows",
+	".vscode/tasks.json"
+];
+/**
+* True when the walker never enters a folder called `name` inside `parent`. Windows ignores
+* case in names, so this does too.
+*/
+function isSkippedFolder(name, parent) {
+	const lower = name.toLowerCase();
+	if (SKIPPED_ANYWHERE.has(lower)) return true;
+	return SKIPPED_AT_DRIVE_ROOT.has(lower) && isDriveRoot(parent);
+}
+function isDriveRoot(dir) {
+	const resolved = path.resolve(dir);
+	return path.parse(resolved).root === resolved;
+}
+/** How many folders to read at once. Disks answer faster with a few requests in flight. */
+const FOLDER_CONCURRENCY = 8;
+/**
+* Reads every folder under `root`, calling `visit` with each folder's entries. `visit` returns
+* the subfolders to enter next. Only real folders are entered, never links.
+*
+* Resolves with the folders that couldn't be opened, as absolute paths, sorted. Rejects only when
+* `root` itself can't be read.
+*/
+function crawl(root, readdir, visit) {
+	const queue = [root];
+	const unreadable = [];
+	let inFlight = 0;
+	return new Promise((resolve, reject) => {
+		const pump = () => {
+			while (inFlight < FOLDER_CONCURRENCY && queue.length > 0) {
+				const dir = queue.pop();
+				inFlight++;
+				readdir(dir).then((entries) => {
+					queue.push(...visit(dir, entries));
+				}, (error) => {
+					if (dir === root) throw error;
+					unreadable.push(dir);
+				}).then(() => {
+					inFlight--;
+					if (inFlight === 0 && queue.length === 0) resolve(unreadable.sort(comparePaths));
+					else pump();
+				}).catch(reject);
+			}
+		};
+		pump();
+	});
+}
+/**
+* Orders paths by character code, treating both separators as /, so the order is the same on
+* Windows and everywhere else. Unsorted, Windows' \ (code 92) would come after capital
+* letters, where / (code 47) comes before them.
+*/
+function comparePaths(a, b) {
+	return compareText(toSlashes(a), toSlashes(b));
+}
+/** A path with forward slashes, as findings and reports show paths on every system. */
+function toSlashes(file) {
+	return file.replaceAll(path.sep, "/");
+}
+/** Subfolders to enter: real folders only (not links or junctions), minus the skipped ones. */
+function subfolders(dir, entries) {
+	return entries.filter((entry) => entry.isDirectory() && !isSkippedFolder(entry.name, dir)).map((entry) => path.join(dir, entry.name));
+}
+function defaultReaddir(dir) {
+	return readdir(dir, { withFileTypes: true });
+}
+/**
+* Finds every project under `root`, including `root` itself: each folder holding one of
+* PROJECT_MARKERS. `.git` may be a folder, or the file git uses for submodules and worktrees.
+* The search carries on inside projects, since a project can hold others.
+*/
+async function findProjects(root, options = {}) {
+	const start = path.resolve(root);
+	const projects = /* @__PURE__ */ new Set();
+	let folders = 0;
+	const kept = /* @__PURE__ */ new Map();
+	const unreadable = await crawl(start, options.readdir ?? defaultReaddir, (dir, entries) => {
+		folders++;
+		const has = (name) => entries.some((entry) => entry.name === name);
+		if (has(".git") || has(".github") || has(".vscode") || kept.has(path.dirname(dir))) kept.set(dir, entries);
+		if (has(".git")) projects.add(dir);
+		const name = path.basename(dir);
+		if (name === ".github" && has("workflows") || name === ".vscode" && has("tasks.json")) projects.add(path.dirname(dir));
+		options.onProgress?.({
+			folders,
+			projects: projects.size
+		});
+		return subfolders(dir, entries);
+	});
+	const read = options.readdir ?? defaultReaddir;
+	return {
+		projects: [...projects].sort(comparePaths),
+		folders,
+		unreadable,
+		readdir: (dir) => {
+			const entries = kept.get(dir);
+			if (!entries) return read(dir);
+			kept.delete(dir);
+			return Promise.resolve(entries);
+		}
+	};
+}
+/**
+* Lists the files in one project, skipping `node_modules`, the inside of `.git`, links, and the
+* folders in `skipFolders` and `skipNames`. It only reads folders, never files: the caller opens
+* each file once, to read it.
+*/
+async function listFiles(root, options = {}) {
+	const start = path.resolve(root);
+	const prefix = start.endsWith(path.sep) ? start : start + path.sep;
+	const relative = (full) => toSlashes(full.slice(prefix.length));
+	const skipFolders = new Set(options.skipFolders ?? []);
+	const skipNames = new Set((options.skipNames ?? []).map((name) => name.toLowerCase()));
+	const entered = (sub) => !skipNames.has(path.basename(sub).toLowerCase()) && (skipFolders.size === 0 || !skipFolders.has(relative(sub)));
+	const files = [];
+	const unreadable = await crawl(start, options.readdir ?? defaultReaddir, (dir, entries) => {
+		for (const entry of entries) {
+			if (!entry.isFile()) continue;
+			const file = relative(path.join(dir, entry.name));
+			files.push(file);
+			options.onFile?.(file);
+		}
+		return subfolders(dir, entries).filter(entered);
+	});
+	return {
+		files: files.sort(compareText),
+		unreadable: unreadable.map(relative)
+	};
+}
+// src/checks/code/jsonc.ts
+var JsoncParseError = class extends Error {};
+/** Deeper nesting than this is refused, so a hostile file can't overflow the stack. */
+const MAX_DEPTH = 256;
+const ESCAPES = {
+	"\"": "\"",
+	"\\": "\\",
+	"/": "/",
+	b: "\b",
+	f: "\f",
+	n: "\n",
+	r: "\r",
+	t: "	"
+};
+const NUMBER = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+/** Throws JsoncParseError, with the line and column of the problem, for text that isn't JSONC. */
+function parseJsonc(text) {
+	return new Parser(text).document();
+}
+/**
+* The value of `key` in an object, or undefined. When a key repeats, the last one wins, as in
+* VS Code and JSON.parse.
+*/
+function field(value, key) {
+	if (value?.kind !== "object") return void 0;
+	for (let i = value.entries.length - 1; i >= 0; i--) {
+		const entry = value.entries[i];
+		if (entry?.key === key) return entry;
+	}
+}
+/** Every string inside a value, at any depth, in order. */
+function allStrings(value) {
+	if (value === void 0) return [];
+	if (value.kind === "string") return [value.value];
+	if (value.kind === "array") return value.items.flatMap(allStrings);
+	if (value.kind === "object") return value.entries.flatMap((entry) => allStrings(entry.value));
+	return [];
+}
+var Parser = class {
+	text;
+	index = 0;
+	line = 1;
+	/** Index of the first character of the current line. */
+	lineStart = 0;
+	constructor(text) {
+		this.text = text;
+		if (text.startsWith("﻿")) {
+			this.index = 1;
+			this.lineStart = 1;
+		}
+	}
+	document() {
+		this.skipBlank();
+		const value = this.value(0);
+		this.skipBlank();
+		if (this.index < this.text.length) this.fail("Unexpected text after the end of the JSON");
+		return value;
+	}
+	value(depth) {
+		if (depth > MAX_DEPTH) this.fail("Nested too deeply");
+		const at = this.position();
+		const char = this.text[this.index];
+		if (char === "{") return this.object(at, depth);
+		if (char === "[") return this.array(at, depth);
+		if (char === "\"") return {
+			kind: "string",
+			value: this.string(),
+			...at
+		};
+		for (const [word, literal] of [
+			["true", true],
+			["false", false],
+			["null", null]
+		]) if (this.text.startsWith(word, this.index)) {
+			this.index += word.length;
+			return {
+				kind: "literal",
+				value: literal,
+				...at
+			};
+		}
+		NUMBER.lastIndex = this.index;
+		const number = NUMBER.exec(this.text);
+		if (number) {
+			this.index += number[0].length;
+			return {
+				kind: "number",
+				value: Number(number[0]),
+				...at
+			};
+		}
+		return this.unexpected("a value");
+	}
+	object(at, depth) {
+		this.index++;
+		const entries = [];
+		this.skipBlank();
+		while (this.text[this.index] !== "}") {
+			if (this.text[this.index] !== "\"") this.unexpected("a property name in double quotes");
+			const keyAt = this.position();
+			const key = this.string();
+			this.skipBlank();
+			this.expect(":");
+			this.skipBlank();
+			entries.push({
+				key,
+				keyAt,
+				value: this.value(depth + 1)
+			});
+			if (!this.comma()) break;
+		}
+		this.expect("}");
+		return {
+			kind: "object",
+			entries,
+			...at
+		};
+	}
+	array(at, depth) {
+		this.index++;
+		const items = [];
+		this.skipBlank();
+		while (this.text[this.index] !== "]") {
+			items.push(this.value(depth + 1));
+			if (!this.comma()) break;
+		}
+		this.expect("]");
+		return {
+			kind: "array",
+			items,
+			...at
+		};
+	}
+	/**
+	* After an item: skips a comma and the blanks after it. Returns false when there is no comma,
+	* so the list must end there. A comma right before the closing bracket is the trailing comma
+	* JSONC allows: the caller's loop sees the bracket and stops.
+	*/
+	comma() {
+		this.skipBlank();
+		if (this.text[this.index] !== ",") return false;
+		this.index++;
+		this.skipBlank();
+		return true;
+	}
+	string() {
+		this.index++;
+		let result = "";
+		for (;;) {
+			const char = this.text[this.index];
+			if (char === void 0) this.fail("Unterminated string");
+			if (char === "\"") break;
+			if (char === "\n" || char === "\r") this.fail("Line break inside a string");
+			if (char === "\\") {
+				const next = this.text[this.index + 1];
+				if (next === "u") {
+					const hex = this.text.slice(this.index + 2, this.index + 6);
+					if (!/^[0-9a-fA-F]{4}$/.test(hex)) this.fail("Invalid \\u escape");
+					result += String.fromCharCode(Number.parseInt(hex, 16));
+					this.index += 6;
+					continue;
+				}
+				const decoded = next === void 0 ? void 0 : ESCAPES[next];
+				if (decoded === void 0) this.fail("Invalid escape in a string");
+				result += decoded;
+				this.index += 2;
+				continue;
+			}
+			result += char;
+			this.index++;
+		}
+		this.index++;
+		return result;
+	}
+	/** Skips spaces, line breaks and comments. */
+	skipBlank() {
+		for (;;) {
+			const char = this.text[this.index];
+			if (char === "\n") this.newLine(this.index + 1);
+			else if (char === " " || char === "	" || char === "\r") this.index++;
+			else if (char === "/" && this.text[this.index + 1] === "/") {
+				const end = this.text.indexOf("\n", this.index);
+				this.index = end === -1 ? this.text.length : end;
+			} else if (char === "/" && this.text[this.index + 1] === "*") {
+				const end = this.text.indexOf("*/", this.index + 2);
+				if (end === -1) this.fail("Unterminated /* comment");
+				for (let i = this.index; i < end; i++) if (this.text[i] === "\n") this.newLine(i + 1);
+				this.index = end + 2;
+			} else return;
+		}
+	}
+	newLine(start) {
+		this.line++;
+		this.lineStart = start;
+		this.index = start;
+	}
+	expect(char) {
+		if (this.text[this.index] !== char) this.unexpected(`"${char}"`);
+		this.index++;
+	}
+	position() {
+		return {
+			line: this.line,
+			column: this.index - this.lineStart + 1
+		};
+	}
+	/** Fails with "Expected …", or "Unexpected end of file" when the text ran out. */
+	unexpected(expected) {
+		return this.fail(this.index >= this.text.length ? "Unexpected end of file" : `Expected ${expected}`);
+	}
+	fail(message) {
+		const { line, column } = this.position();
+		throw new JsoncParseError(`${message} at line ${line}, column ${column}`);
+	}
+};
+// src/checks/code/autorun-task.ts
+const TASKS_FILE = ".vscode/tasks.json";
+const SETTINGS_FILE = ".vscode/settings.json";
+const autorunTask = {
+	id: "code/autorun-task",
+	title: "Task runs when the folder opens",
+	severity: "medium",
+	description: "A VS Code task with \"runOn\": \"folderOpen\" runs a command as soon as someone opens the folder, before they've read any of the code. The PolinRider malware campaign hides its loader this way in fake take-home assignments and infected repositories. Some real projects use it to start a file watcher, so a plain auto-run task is medium. It is critical when the task also runs node, a shell or python on a file that isn't a script (such as a font), pipes a download into a shell, hides its output, or contacts a vercel.app /settings/ address. It is high when .vscode/settings.json also sets \"task.allowAutomaticTasks\" to \"on\", which tries to let tasks run without VS Code asking first.",
+	remediation: "Open .vscode/tasks.json in a plain text editor, without opening the folder in VS Code, and read the task's \"command\" and \"args\" to see what it runs. If you don't recognise the task, delete it from the \"tasks\" list, and check the files it names and the rest of the repository before you open it in VS Code. If the project really needs it, accept the finding in devsweep.config.json. Either way, set \"task.allowAutomaticTasks\": \"off\" in your own VS Code user settings, so no folder can run tasks without asking you."
+};
+const PLATFORMS = [
+	["windows", "Windows"],
+	["osx", "macOS"],
+	["linux", "Linux"]
+];
+/** Interpreters, and the file extensions of the scripts each one normally runs. */
+const SCRIPT_EXTENSIONS = {
+	node: [
+		"js",
+		"mjs",
+		"cjs",
+		"ts",
+		"mts",
+		"cts",
+		"jsx",
+		"tsx"
+	],
+	bash: ["sh", "bash"],
+	sh: ["sh", "bash"],
+	python: ["py", "pyw"],
+	powershell: ["ps1", "psm1"]
+};
+/** Other names the same interpreters go by. */
+const INTERPRETER_ALIASES = {
+	nodejs: "node",
+	zsh: "bash",
+	dash: "sh",
+	python2: "python",
+	python3: "python",
+	py: "python",
+	pwsh: "powershell"
+};
+/**
+* Options that end the search for a file: what follows is inline code or a module name. Matched
+* exactly, since `-c` and `-C` differ for most of these programs.
+*/
+const INLINE_CODE_OPTIONS = /* @__PURE__ */ new Set([
+	"-c",
+	"-e",
+	"--eval",
+	"-p",
+	"--print",
+	"-m"
+]);
+/** Options whose value is the next word, which is not the file being run. Matched exactly. */
+const VALUE_OPTIONS = /* @__PURE__ */ new Set([
+	"-r",
+	"--require",
+	"--import",
+	"--loader",
+	"-W",
+	"-X"
+]);
+/** PowerShell's options, which ignore case: -Command takes code, the others a value. */
+const POWERSHELL_INLINE_CODE = /* @__PURE__ */ new Set([
+	"-command",
+	"-c",
+	"-encodedcommand",
+	"-ec"
+]);
+const POWERSHELL_VALUE_OPTIONS = /* @__PURE__ */ new Set([
+	"-executionpolicy",
+	"-ep",
+	"-windowstyle"
+]);
+/** Words after which a new command starts. */
+const SEPARATORS = /* @__PURE__ */ new Set([
+	"&&",
+	"||",
+	"|",
+	";",
+	"&",
+	"/c",
+	"/k"
+]);
+const FONT_EXTENSIONS = /* @__PURE__ */ new Set([
+	"woff2",
+	"woff",
+	"ttf",
+	"otf",
+	"eot"
+]);
+const IMAGE_EXTENSIONS = /* @__PURE__ */ new Set([
+	"png",
+	"jpg",
+	"jpeg",
+	"gif",
+	"svg",
+	"ico",
+	"bmp",
+	"webp"
+]);
+/** `curl … | bash`, `wget … | sh`, and the same with sudo. */
+const CURL_TO_SHELL = /\b(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b/i;
+/** `bash -c "$(curl …)"` and `bash <(curl …)`. */
+const SHELL_RUNS_DOWNLOAD = /\b(?:ba|z|da)?sh\s+(?:-c\s+)?["']?(?:\$\(|<\()\s*(?:curl|wget)\b/i;
+/** `iwr … | iex`, `Invoke-WebRequest … | Invoke-Expression`, and `irm`. */
+const WEB_REQUEST_TO_IEX = /\b(?:iwr|irm|invoke-webrequest|invoke-restmethod)\b[^|\n]*\|\s*(?:iex|invoke-expression)\b/i;
+/** A vercel.app address with a /settings/ path, the shape of PolinRider's servers. */
+const VERCEL_SETTINGS = /(?<![a-z0-9.-])(?:[a-z0-9-]+\.)+vercel\.app(?::\d+)?(?:\/[^\s"'`|]*)?\/settings\//i;
+const MAX_LABEL_IN_MESSAGE = 60;
+/** Reports each task in a parsed tasks.json that runs when the folder opens. */
+function analyze$8(tasksJson, settings) {
+	const tasks = field(tasksJson, "tasks")?.value;
+	if (tasks?.kind !== "array") return [];
+	const rootPresentation = field(tasksJson, "presentation")?.value;
+	return tasks.items.flatMap((task, index) => {
+		if (task.kind !== "object") return [];
+		const trigger = autorunTrigger(task);
+		if (!trigger) return [];
+		const name = taskName(task, index);
+		const signals = dangerSignals(task, rootPresentation);
+		const when = trigger.platforms === void 0 ? "runs automatically when the folder opens" : `runs automatically when the folder opens on ${trigger.platforms}`;
+		const allowed = settings.allowAutomaticTasks;
+		let message = `${name.display} ${when}`;
+		if (signals.length > 0) message += `, and ${list(signals)}`;
+		message += ".";
+		if (allowed) message += ` ${SETTINGS_FILE} also sets "task.allowAutomaticTasks" to "on", which tries to let tasks run without VS Code asking first.`;
+		return [createFinding(autorunTask, {
+			file: TASKS_FILE,
+			at: trigger.at,
+			subject: name.subject,
+			message,
+			severity: signals.length > 0 ? "critical" : allowed ? "high" : "medium",
+			remediation: `Read this task's "command" and "args" in ${TASKS_FILE} with a plain text editor, without opening the folder in VS Code. If you don't recognise it, delete the task and check the files it names. Set "task.allowAutomaticTasks": "off" in your own VS Code user settings, so no folder can run tasks without asking you.`
+		})];
+	});
+}
+/**
+* Finds `"runOptions": { "runOn": "folderOpen" }` on the task itself or in its windows, osx or
+* linux block. Returns where the first one is, and which platforms it is limited to, if any.
+*/
+function autorunTrigger(task) {
+	const own = folderOpen(task);
+	if (own) return { at: own.keyAt };
+	const matches = PLATFORMS.flatMap(([key, label]) => {
+		const entry = folderOpen(field(task, key)?.value);
+		return entry ? [{
+			entry,
+			label
+		}] : [];
+	});
+	const [first] = matches;
+	if (!first) return void 0;
+	return {
+		at: first.entry.keyAt,
+		platforms: list(matches.map((m) => m.label))
+	};
+}
+function folderOpen(block) {
+	const runOn = field(field(block, "runOptions")?.value, "runOn");
+	return runOn?.value.kind === "string" && runOn.value.value === "folderOpen" ? runOn : void 0;
+}
+/** What the task shows in a finding, and the subject used to accept it in the config file. */
+function taskName(task, index) {
+	const script = text(field(task, "script")?.value);
+	const npmLabel = text(field(task, "type")?.value) === "npm" && script !== void 0 ? `npm: ${script}` : void 0;
+	const label = text(field(task, "label")?.value) ?? text(field(task, "taskName")?.value) ?? npmLabel;
+	if (label !== void 0) return {
+		display: `Task "${label.length > MAX_LABEL_IN_MESSAGE ? `${label.slice(0, 59)}…` : label}"`,
+		subject: label
+	};
+	return {
+		display: `Task ${index + 1} (no label)`,
+		subject: `task ${index + 1}`
+	};
+}
+/** The reasons, in plain words, that make this auto-run task critical. Never quotes the command. */
+function dangerSignals(task, rootPresentation) {
+	const signals = /* @__PURE__ */ new Set();
+	const variants = [task, ...PLATFORMS.flatMap(([key]) => {
+		const block = field(task, key)?.value;
+		return block?.kind === "object" ? [block] : [];
+	})];
+	for (const variant of variants) {
+		const command = field(variant, "command")?.value ?? field(task, "command")?.value;
+		const args = field(variant, "args")?.value ?? field(task, "args")?.value;
+		const words = [...commandWords(command), ...commandWords(args)];
+		for (const signal of interpreterOnData(words)) signals.add(signal);
+	}
+	const everything = allStrings(task).join(" ");
+	if (CURL_TO_SHELL.test(everything) || SHELL_RUNS_DOWNLOAD.test(everything) || WEB_REQUEST_TO_IEX.test(everything)) signals.add("downloads a script and runs it in a shell");
+	const presentations = [field(task, "presentation")?.value, ...PLATFORMS.map(([key]) => field(field(task, key)?.value, "presentation")?.value)];
+	const setting = (key) => {
+		const own = presentations.flatMap((p) => field(p, key)?.value ?? []);
+		return own.length > 0 ? own : [field(rootPresentation, key)?.value];
+	};
+	if (setting("reveal").some((v) => v?.kind === "string" && v.value === "never")) signals.add("hides its terminal");
+	if (setting("echo").some((v) => v?.kind === "literal" && v.value === false)) signals.add("doesn't show the command it runs");
+	if (VERCEL_SETTINGS.test(everything)) signals.add("contacts a vercel.app /settings/ address, a pattern PolinRider uses");
+	return [...signals];
+}
+/**
+* Finds an interpreter (node, bash, sh, python, powershell) at the start of a command, and checks
+* the file it runs. Returns e.g. "runs node on a font file" when that file isn't a script.
+*/
+function interpreterOnData(words) {
+	const found = [];
+	let commandStart = true;
+	for (let i = 0; i < words.length; i++) {
+		const word = words[i] ?? "";
+		if (SEPARATORS.has(word.toLowerCase())) {
+			commandStart = true;
+			continue;
+		}
+		if (!commandStart) continue;
+		commandStart = false;
+		const interpreter = interpreterName(word);
+		if (interpreter === void 0) continue;
+		const file = fileArgument(words, i + 1, interpreter === "powershell");
+		if (file === void 0) continue;
+		if (file.inline) {
+			commandStart = true;
+			i = file.index - 1;
+			continue;
+		}
+		const extension = extensionOf$1(file.word);
+		const scripts = SCRIPT_EXTENSIONS[interpreter] ?? [];
+		if (extension !== void 0 && !scripts.includes(extension)) found.push(`runs ${interpreter} on ${describeFile(extension)}`);
+	}
+	return found;
+}
+/** The first word after an interpreter that names the file it runs, skipping options. */
+function fileArgument(words, from, powershell) {
+	for (let i = from; i < words.length; i++) {
+		const word = words[i] ?? "";
+		const lower = word.toLowerCase();
+		if (SEPARATORS.has(lower)) return void 0;
+		if (powershell ? POWERSHELL_INLINE_CODE.has(lower) : INLINE_CODE_OPTIONS.has(word)) return {
+			word,
+			index: i + 1,
+			inline: true
+		};
+		if (powershell ? POWERSHELL_VALUE_OPTIONS.has(lower) : VALUE_OPTIONS.has(word)) {
+			i++;
+			continue;
+		}
+		if (word.startsWith("-")) continue;
+		return {
+			word,
+			index: i,
+			inline: false
+		};
+	}
+}
+function interpreterName(word) {
+	const base = (word.split(/[\\/]/).pop() ?? "").toLowerCase().replace(/\.exe$/, "");
+	const name = INTERPRETER_ALIASES[base] ?? base;
+	return name in SCRIPT_EXTENSIONS ? name : void 0;
+}
+/** The file's extension in lower case, or undefined when it has none. */
+function extensionOf$1(path) {
+	const base = path.split(/[\\/]/).pop() ?? "";
+	const match = /\.([a-z0-9]{1,10})$/i.exec(base);
+	return match && match.index > 0 ? match[1]?.toLowerCase() : void 0;
+}
+function describeFile(extension) {
+	if (FONT_EXTENSIONS.has(extension)) return "a font file";
+	if (IMAGE_EXTENSIONS.has(extension)) return "an image file";
+	return `a ".${extension}" file, which isn't a script`;
+}
+/**
+* The words of a command or args value. VS Code accepts a string, a list of strings, or
+* `{ "value": …, "quoting": … }` in place of any string.
+*/
+function commandWords(value) {
+	if (value === void 0) return [];
+	if (value.kind === "string") {
+		const whole = value.value.trim();
+		return interpreterName(whole) !== void 0 ? [whole] : splitWords(whole);
+	}
+	if (value.kind === "array") return value.items.flatMap(commandWords);
+	if (value.kind === "object") return commandWords(field(value, "value")?.value);
+	return [];
+}
+/**
+* Splits on blanks and around `;`, `|` and `&`, and drops quotes so `"node"` and `'node'` read
+* as node.
+*/
+function splitWords(command) {
+	return command.replace(/&&|\|\||[;|&]/g, " $& ").split(/\s+/).map((word) => word.replace(/^["'`]+|["'`]+$/g, "")).filter((word) => word !== "");
+}
+function text(value) {
+	return value?.kind === "string" && value.value !== "" ? value.value : void 0;
+}
+// src/checks/code/text.ts
+/** The 1-based line and column of an offset in `text`. Counts line breaks once, with indexOf. */
+function lineAndColumn(text, offset) {
+	let line = 1;
+	let lineStart = 0;
+	for (let next = text.indexOf("\n"); next !== -1 && next < offset; next = text.indexOf("\n", next + 1)) {
+		line++;
+		lineStart = next + 1;
+	}
+	return {
+		line,
+		column: offset - lineStart + 1
+	};
+}
+/** Calls `visit` with each line of `text` and its 1-based number, without the line break. */
+function forEachLine(text, visit) {
+	let start = 0;
+	let number = 1;
+	while (start <= text.length) {
+		let end = text.indexOf("\n", start);
+		if (end === -1) end = text.length;
+		const stop = end > start && text.charCodeAt(end - 1) === 13 ? end - 1 : end;
+		visit(text.slice(start, stop), number);
+		if (end === text.length) return;
+		start = end + 1;
+		number++;
+	}
+}
+/** The last part of a path with forward slashes. */
+function baseName(file) {
+	return file.slice(file.lastIndexOf("/") + 1);
+}
+/** The file's extension in lower case, without the dot, or '' when it has none. */
+function extensionOf(file) {
+	const name = baseName(file);
+	const dot = name.lastIndexOf(".");
+	return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
+/** True for characters that can be part of a JavaScript name: letters, digits, _ and $. */
+function isNameChar(code) {
+	return code >= 48 && code <= 57 || code >= 65 && code <= 90 || code >= 97 && code <= 122 || code === 95 || code === 36 || code > 127;
+}
+// src/checks/code/disguised-file.ts
+const disguisedFile = {
+	id: "code/disguised-file",
+	title: "Font file that isn't a font",
+	severity: "high",
+	hidesSource: true,
+	description: "A file named like a font (.woff2, .woff, .ttf, .otf or .eot) whose first bytes are not any font format, or a font-like name no font uses, such as fa-solid-400.llf. The PolinRider malware campaign hides its JavaScript in fake Font Awesome fonts, then runs them with node from a VS Code task or an npm script. Critical when the file is mostly readable text, or a command in .vscode/tasks.json or package.json names it. Empty files and Git LFS pointers (the small text files left in place of fonts stored in Git LFS) are skipped.",
+	remediation: "Don't run the file. Open it in a plain text editor: a real font is unreadable binary data. If it holds code, delete it, remove any task or script that runs it, and check the repository's history for who added it. If you ran the project, treat your machine as compromised and rotate tokens from a clean device. If the file is a real font in an unusual format, accept the finding in devsweep.config.json."
+};
+/** The font formats checked, by extension, as named in findings. */
+const FONT_FORMATS = {
+	woff2: "WOFF2",
+	woff: "WOFF",
+	ttf: "TrueType",
+	otf: "OpenType",
+	eot: "EOT"
+};
+/** Font Awesome-style names with extensions no font format uses, as PolinRider names them. */
+const FAKE_FONT_NAME = /^fa-[a-z]+(?:-[0-9]{3})?\.(?:llf|lkf)$/i;
+/** What a checkout leaves in place of a file stored in Git LFS, when LFS isn't installed. */
+const LFS_POINTER = Buffer.from("version https://git-lfs.github.com/spec/v1");
+/** How much of a file is read: enough for the "mostly text" test. */
+const HEAD_BYTES = 4096;
+/** Share of printable bytes above which a file counts as text. Real fonts are far below it. */
+const TEXT_SHARE = .9;
+/** True for files this rule reads, by name alone. The walker lists them even when binary. */
+function isCandidate(file) {
+	return extensionOf(file) in FONT_FORMATS || FAKE_FONT_NAME.test(baseName(file));
+}
+/**
+* Checks one candidate file. `namedBy` is the tasks.json or package.json whose command names
+* the file, if any.
+*/
+function analyze$7(file, head, namedBy) {
+	if (head.size === 0 || startsWith(head.bytes, LFS_POINTER)) return [];
+	const fakeName = FAKE_FONT_NAME.test(baseName(file));
+	if (!fakeName && isFont(head.bytes)) return [];
+	const text = isMostlyText(head.bytes);
+	let message = fakeName ? `Named like a Font Awesome font, but ".${extensionOf(file)}" isn't a font format. PolinRider names its fake fonts like this.` : `Named like a ${FONT_FORMATS[extensionOf(file)]} font, but it doesn't start with the signature of any font format.`;
+	if (text) message += " It is mostly readable text, which is how PolinRider hides JavaScript in fake fonts.";
+	if (namedBy !== void 0) message += ` A command in ${namedBy} names it.`;
+	return [createFinding(disguisedFile, {
+		file,
+		at: { line: 1 },
+		message,
+		severity: text || namedBy !== void 0 ? "critical" : "high"
+	})];
+}
+/**
+* True when the bytes start like a font of any format: WOFF2, WOFF, TrueType (two signatures),
+* OpenType, a font collection, PostScript Type 1 in a TrueType wrapper, or EOT (whose signature
+* sits at byte 34). Any format is accepted for any font extension: a real font with the wrong
+* extension is a mistake, not an attack.
+*/
+function isFont(bytes) {
+	const tag = bytes.subarray(0, 4).toString("latin1");
+	if ([
+		"wOF2",
+		"wOFF",
+		"OTTO",
+		"true",
+		"ttcf",
+		"typ1"
+	].includes(tag)) return true;
+	if (bytes[0] === 0 && bytes[1] === 1 && bytes[2] === 0 && bytes[3] === 0) return true;
+	return bytes[34] === 76 && bytes[35] === 80;
+}
+/** True when nine bytes in ten are printable ASCII, tabs or line breaks. */
+function isMostlyText(bytes) {
+	if (bytes.length === 0) return false;
+	let printable = 0;
+	for (const byte of bytes) if (byte >= 32 && byte <= 126 || byte === 9 || byte === 10 || byte === 13) printable++;
+	return printable / bytes.length >= TEXT_SHARE;
+}
+function startsWith(bytes, prefix) {
+	return bytes.length >= prefix.length && bytes.subarray(0, prefix.length).equals(prefix);
+}
+/** True when one of the commands, given in lower case, contains the file's name. */
+function namesFile(commands, file) {
+	const name = baseName(file).toLowerCase();
+	return commands.some((command) => command.includes(name));
+}
+// src/checks/code/hidden-padding.ts
+const hiddenPadding = {
+	id: "code/hidden-padding",
+	title: "Code hidden after a long run of spaces",
+	severity: "high",
+	hidesSource: true,
+	description: "A line has 64 or more spaces or tabs in a row, then more code. Code that far to the right is off-screen in most editors and in GitHub's diff view, so a reviewer doesn't see it. Every known variant of the PolinRider malware campaign hides its loader this way, at the end of a real file such as a build config. Critical when the hidden code also runs text as code (eval, new Function), decodes base64 (atob, Buffer.from) or sets a global variable. Markdown, .txt and .csv files are skipped, and so is padding followed by a comment.",
+	remediation: "Open the file in a plain text editor with line wrapping on, or scroll to the line's end, and read what follows the spaces. If you didn't write it, don't build or run the project: delete the hidden code, check the file's git history for who added it, and check the rest of the repository and your machine. If the long line is intended, such as generated data, accept the finding in devsweep.config.json."
+};
+/**
+* Prose and data files, where long runs of spaces are layout, not hiding, and source maps, which
+* hold copies of source files already read on their own.
+*/
+const SKIPPED_EXTENSIONS$1 = /* @__PURE__ */ new Set([
+	"md",
+	"txt",
+	"csv",
+	"map"
+]);
+/** How many other padded lines a finding names before it just counts them. */
+const OTHER_LINES_SHOWN = 5;
+/** How far past a match the checks for running code look. Keeps each check short. */
+const NEAR = 400;
+function appliesTo$1(file) {
+	return !SKIPPED_EXTENSIONS$1.has(extensionOf(file));
+}
+/**
+* Finds the first run of spaces and tabs that is followed by code on the same line: 64 or more
+* after other text, or 128 or more at the start of the line. Reads the line once, counting
+* spaces, so a line megabytes long is still quick. Padding before the end of the line, before a
+* comment, or inside a comment line isn't hiding anything that runs, and doesn't count.
+*/
+function findPadding(line) {
+	let end = line.length;
+	while (end > 0 && (isBlank(line.charCodeAt(end - 1)) || line.charCodeAt(end - 1) === 13)) end--;
+	let run = 0;
+	let spaces = 0;
+	for (let i = 0; i < end; i++) {
+		const code = line.charCodeAt(i);
+		if (isBlank(code)) {
+			run++;
+			if (code === 32) spaces++;
+			continue;
+		}
+		const atLineStart = run === i;
+		if (run >= (atLineStart ? 128 : 64)) {
+			if (!atLineStart && insideCommentLine(line, i - run)) return void 0;
+			const start = codeStart(line, i, end);
+			if (start === -1) return void 0;
+			return {
+				column: start + 1,
+				spaces,
+				tabs: run - spaces,
+				codeLength: end - start,
+				signs: dangerSigns(line, start)
+			};
+		}
+		run = 0;
+		spaces = 0;
+	}
+}
+/** Any run long enough to be padding. One native search rules out almost every file. */
+const LONG_RUN = new RegExp(`[ \\t]{64}`);
+/** The single finding for a file: its most telling padded line, naming the others. */
+function analyze$6(file, text) {
+	if (!LONG_RUN.test(text)) return [];
+	const padded = [];
+	forEachLine(text, (line, number) => {
+		const padding = findPadding(line);
+		if (padding) padded.push({
+			line: number,
+			padding
+		});
+	});
+	const shown = padded.find((p) => p.padding.signs.length > 0) ?? padded[0];
+	if (!shown) return [];
+	const { padding } = shown;
+	let message = `${describePadding(padding)}, then ${plural(padding.codeLength, "character")} of code at column ${count(padding.column)}. Code this far right is off-screen in most editors, which is how the PolinRider campaign hides its loader.`;
+	if (padding.signs.length > 0) message += ` The hidden code ${list(padding.signs)}.`;
+	const others = padded.filter((p) => p !== shown).map((p) => count(p.line));
+	if (others.length > 0) {
+		const named = others.slice(0, OTHER_LINES_SHOWN);
+		const rest = others.length - named.length;
+		message += ` ${plural(others.length, "other line")} in this file ${others.length === 1 ? "is" : "are"} padded the same way: ${list(rest > 0 ? [...named, `${count(rest)} more`] : named)}.`;
+	}
+	return [createFinding(hiddenPadding, {
+		file,
+		at: {
+			line: shown.line,
+			column: padding.column
+		},
+		message,
+		severity: padding.signs.length > 0 ? "critical" : "high"
+	})];
+}
+function isBlank(code) {
+	return code === 32 || code === 9;
+}
+/** "438 spaces", "131 tabs", "200 spaces and tabs". */
+function describePadding({ spaces, tabs }) {
+	if (tabs === 0) return plural(spaces, "space");
+	if (spaces === 0) return plural(tabs, "tab");
+	return `${count(spaces + tabs)} spaces and tabs`;
+}
+/**
+* True when the line starts with a comment that is still open where the padding starts at
+* `paddingStart`: a `//`, `#` or `--` line, or a `/*` or `*` line whose comment hasn't closed.
+* Code there never runs: these are lined-up notes. Only the line's start is checked, so a `//`
+* inside a string, such as a URL, can't hide a payload.
+*/
+function insideCommentLine(line, paddingStart) {
+	let i = 0;
+	while (i < paddingStart && isBlank(line.charCodeAt(i))) i++;
+	if (line.startsWith("//", i) || line.startsWith("#", i) || line.startsWith("--", i)) return true;
+	if (line.startsWith("/*", i) || line.startsWith("*", i)) {
+		const closed = line.indexOf("*/", line.startsWith("/*", i) ? i + 2 : i);
+		return closed === -1 || closed + 2 > paddingStart;
+	}
+	return false;
+}
+/**
+* Where the code after the padding starts, skipping comments, or -1 when only comments follow.
+* A block comment that closes on the same line is skipped, and whatever follows it still counts:
+* a payload can start with a comment.
+*/
+function codeStart(line, from, end) {
+	let i = from;
+	while (i < end) {
+		if (line.startsWith("/*", i) || line.startsWith("<!--", i)) {
+			const close = line.startsWith("/*", i) ? "*/" : "-->";
+			const closed = line.indexOf(close, i + 2);
+			if (closed === -1 || closed >= end) return -1;
+			i = closed + close.length;
+			while (i < end && isBlank(line.charCodeAt(i))) i++;
+			continue;
+		}
+		return line.startsWith("//", i) || line.startsWith("#", i) || line.startsWith("--", i) || line.startsWith("*", i) && !line.startsWith("*/", i) ? -1 : i;
+	}
+	return -1;
+}
+/**
+* The signs that hidden code runs something, in plain words. Each search is one pass with
+* indexOf, and each match is checked within a few hundred characters, so this stays linear.
+*/
+function dangerSigns(line, from) {
+	const signs = [];
+	if (findCall(line, from, "eval(")) signs.push("runs text as code (eval)");
+	if (findCall(line, from, "new Function(")) signs.push("builds a function from text (new Function)");
+	if (findCall(line, from, "atob(")) signs.push("decodes base64 (atob)");
+	if (decodesBase64Buffer(line, from)) signs.push("decodes base64 (Buffer.from)");
+	const global = globalAssignment(line, from);
+	if (global === "require") signs.push("puts require or module on a global variable");
+	else if (global === "value") signs.push("sets a global variable");
+	return signs;
+}
+/** True when `call` appears from `from` on, not as the end of a longer name like `myeval(`. */
+function findCall(text, from, call) {
+	for (let at = text.indexOf(call, from); at !== -1; at = text.indexOf(call, at + 1)) if (at === 0 || !isNameChar(text.charCodeAt(at - 1))) return true;
+	return false;
+}
+/** `Buffer.from(` with `base64` in the next few hundred characters. */
+function decodesBase64Buffer(text, from) {
+	const call = "Buffer.from(";
+	for (let at = text.indexOf(call, from); at !== -1; at = text.indexOf(call, at + 1)) if (text.slice(at + 12, at + 12 + NEAR).includes("base64")) return true;
+	return false;
+}
+/**
+* Finds an assignment to a property of `global` or `globalThis`, such as `global.x = …` or
+* `global['x'] = …`. Returns 'require' when the value is `require` or `module`, the loader's
+* way of reaching Node's modules from code run by eval.
+*/
+function globalAssignment(text, from) {
+	let found;
+	for (let at = text.indexOf("global", from); at !== -1; at = text.indexOf("global", at + 6)) {
+		if (at > 0 && isNameChar(text.charCodeAt(at - 1))) continue;
+		let p = at + 6;
+		if (text.startsWith("This", p)) p += 4;
+		if (text[p] === ".") {
+			const nameStart = ++p;
+			while (p - nameStart < 64 && isNameChar(text.charCodeAt(p))) p++;
+			if (p === nameStart) continue;
+		} else if (text[p] === "[") {
+			const close = text.slice(p, p + 66).indexOf("]");
+			if (close === -1) continue;
+			p += close + 1;
+		} else continue;
+		p = skipBlanks(text, p);
+		if (text[p] !== "=" || text[p + 1] === "=" || text[p + 1] === ">") continue;
+		p = skipBlanks(text, p + 1);
+		for (const value of ["require", "module"]) if (text.startsWith(value, p) && !isNameChar(text.charCodeAt(p + value.length))) return "require";
+		found = "value";
+	}
+	return found;
+}
+/** Skips up to 16 spaces and tabs: enough for any real assignment, and never a long scan. */
+function skipBlanks(text, from) {
+	let p = from;
+	while (p - from < 16 && isBlank(text.charCodeAt(p))) p++;
+	return p;
+}
+/*!
+* Known PolinRider markers for code/known-marker.
+*
+* The strings and patterns below come from meSingh/polinrider-scanner, files ioc/strong.txt and
+* ioc/strong-patterns.txt at commit 3073dfd3e702e362dab339a3e4bc30674e88725d, used under the MIT
+* license:
+*
+* MIT License
+*
+* Copyright (c) 2026 Mandeep Singh
+*
+* Permission is hereby granted, free of charge, to any person obtaining a copy
+* of this software and associated documentation files (the "Software"), to deal
+* in the Software without restriction, including without limitation the rights
+* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+* copies of the Software, and to permit persons to whom the Software is
+* furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in all
+* copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+* SOFTWARE.
+*/
+const SOURCE_BASE = `https://github.com/meSingh/polinrider-scanner/blob/3073dfd3e702e362dab339a3e4bc30674e88725d/ioc/`;
+/** A link to the line an entry came from. */
+function sourceOf(file, line) {
+	return `${SOURCE_BASE}${file}#L${line}`;
+}
+const FIXED_MARKERS = [
+	{
+		kind: "obfuscator marker",
+		hex: "726d63656a256f746225",
+		line: 5,
+		reported: "OpenSourceMalware, PolinRider dossier"
+	},
+	{
+		kind: "obfuscator marker",
+		hex: "436f742533743d73687450",
+		line: 6,
+		reported: "OpenSourceMalware, PolinRider dossier"
+	},
+	{
+		kind: "obfuscator marker",
+		hex: "5f245f31653432",
+		line: 7,
+		reported: "OpenSourceMalware, PolinRider dossier"
+	},
+	{
+		kind: "obfuscator marker",
+		hex: "66756e6374696f6e204d4479",
+		line: 8,
+		reported: "OpenSourceMalware, PolinRider dossier"
+	},
+	{
+		kind: "campaign tag",
+		hex: "676c6f62616c5b2721275d",
+		line: 9,
+		reported: "OpenSourceMalware, PolinRider dossier"
+	},
+	{
+		kind: "campaign tag",
+		hex: "676c6f62616c5b275f56275d",
+		line: 10,
+		reported: "OpenSourceMalware, PolinRider dossier"
+	},
+	{
+		kind: "campaign tag",
+		hex: "676c6f62616c5b225f56225d",
+		line: 11,
+		reported: "OpenSourceMalware, PolinRider dossier"
+	},
+	{
+		kind: "XOR key",
+		hex: "325b675766476a3b3c3a2d39335a5e43",
+		line: 12,
+		reported: "OpenSourceMalware, PolinRider dossier"
+	},
+	{
+		kind: "XOR key",
+		hex: "6d363a7454685e442963427a3f4e4d5d",
+		line: 13,
+		reported: "OpenSourceMalware, PolinRider dossier"
+	},
+	{
+		kind: "blockchain address",
+		hex: "544d664b51456437544a4a6135784e5a4a5a324c657038333876727a7273376d4150",
+		line: 16
+	},
+	{
+		kind: "blockchain address",
+		hex: "545866784855657439704a5655314267566b42416272455334595563316e477a6347",
+		line: 17
+	},
+	{
+		kind: "blockchain address",
+		hex: "307862653033373430303637306662663163333233363466373632393735393038646334336565623338373539323633653764666364616263373633383038313165",
+		line: 18
+	},
+	{
+		kind: "blockchain address",
+		hex: "307833663065353738316430383535666234363036363161633633323537333736646231393431623262623532323439396534373537656362336562643564636533",
+		line: 19
+	},
+	{
+		kind: "campaign id",
+		hex: "65396235336137632d323334322d346231352d623032642d626438623866366130336639",
+		line: 22
+	},
+	{
+		kind: "C2 host",
+		hex: "64656661756c742d636f6e66696775726174696f6e2e76657263656c2e617070",
+		line: 23
+	},
+	{
+		kind: "C2 host",
+		hex: "7673636f64652d73657474696e67732d626f6f7473747261702e76657263656c2e617070",
+		line: 24
+	},
+	{
+		kind: "C2 host",
+		hex: "7673636f64652d73657474696e67732d636f6e6669672e76657263656c2e617070",
+		line: 25
+	},
+	{
+		kind: "C2 host",
+		hex: "7673636f64652d626f6f7473747261707065722e76657263656c2e617070",
+		line: 26
+	},
+	{
+		kind: "C2 host",
+		hex: "7673636f64652d6c6f61642d636f6e6669672e76657263656c2e617070",
+		line: 27
+	},
+	{
+		kind: "C2 host",
+		hex: "3236303132302e76657263656c2e617070",
+		line: 28
+	},
+	{
+		kind: "fake font command",
+		hex: "6e6f6465202e2f7075626c69632f666f6e74732f66612d736f6c69642d3430302e776f666632",
+		line: 48,
+		reported: "OpenSourceMalware, 2026-08"
+	},
+	{
+		kind: "campaign tag",
+		hex: "4131302d6e706d3321",
+		line: 56,
+		reported: "OpenSourceMalware, 2026-08"
+	},
+	{
+		kind: "blockchain address",
+		hex: "307861333232653566336433313164333038306536663031323130363365396164633234393065663161",
+		line: 57,
+		reported: "OpenSourceMalware, 2026-08"
+	},
+	{
+		kind: "campaign tag",
+		hex: "676c6f62616c2e693d2241382d",
+		line: 67,
+		reported: "OpenSourceMalware, 2026-08"
+	},
+	{
+		kind: "campaign tag",
+		hex: "676c6f62616c2e69203d20274138",
+		line: 78,
+		reported: "OpenSourceMalware, 2026-09"
+	},
+	{
+		kind: "XOR key",
+		hex: "7134465a6b78587b2168",
+		line: 88,
+		reported: "OpenSourceMalware, 2026-09"
+	},
+	{
+		kind: "XOR key",
+		hex: "792d705f3e6424304226405e3161516b",
+		line: 89,
+		reported: "OpenSourceMalware, 2026-09"
+	},
+	{
+		kind: "blockchain address",
+		hex: "3333666633656461663535613865303364636263376362343064343938613439",
+		line: 104,
+		reported: "SafeDep, 2026-09"
+	},
+	{
+		kind: "obfuscator marker",
+		hex: "5f245f66656430",
+		line: 105,
+		reported: "SafeDep, 2026-09"
+	},
+	{
+		kind: "campaign tag",
+		hex: "676c6f62616c2e6f3d27352d",
+		line: 106,
+		reported: "SafeDep, 2026-09"
+	},
+	{
+		kind: "XOR key",
+		hex: "5955376d7b72452f3e7c3d3d623e237e",
+		line: 107,
+		reported: "SafeDep, 2026-09"
+	},
+	{
+		kind: "blockchain address",
+		hex: "307861333232453566334433313144333038306536663031323130363365396144433234393045663161",
+		line: 116,
+		reported: "SafeDep, 2026-09"
+	},
+	{
+		kind: "blockchain address",
+		hex: "54437166365a6b61514438347659734332637575316a527742364a76655461527246",
+		line: 122,
+		reported: "SafeDep, 2026-09"
+	},
+	{
+		kind: "blockchain address",
+		hex: "54464d727942396d3664346b424d526a455679465262714b5356316356324e637048",
+		line: 123,
+		reported: "SafeDep, 2026-09"
+	},
+	{
+		kind: "blockchain address",
+		hex: "307833643230373566393762376231653332333462643635333737396432316336303564376438633665633963393864393833383830626535633766346639343731",
+		line: 124,
+		reported: "SafeDep, 2026-09"
+	},
+	{
+		kind: "blockchain address",
+		hex: "307839643230326338323434303263613839653961616363643233393062366638623333326165373433636161313436396336393566656232373831643536353139",
+		line: 125,
+		reported: "SafeDep, 2026-09"
+	},
+	{
+		kind: "payload staging account",
+		hex: "7465737432363333303333312f74657374",
+		line: 147,
+		reported: "Deception.Pro, 2026-09"
+	},
+	{
+		kind: "blockchain address",
+		hex: "307831656566303834396564613135643837663634653531633733633834343263663363386263656633",
+		line: 161,
+		reported: "GitGuardian, Greenflagged and Sonatype, 2026-10 and 2026-11"
+	},
+	{
+		kind: "campaign tag",
+		hex: "5a327876596d46734c6d6b675053416e",
+		line: 174,
+		reported: "Greenflagged and OpenSSF MAL-2026-18643, 2026-11"
+	},
+	{
+		kind: "campaign tag",
+		hex: "4131302d6e706d5f696e6a656374",
+		line: 175,
+		reported: "Greenflagged and OpenSSF MAL-2026-18643, 2026-11"
+	},
+	{
+		kind: "stage 2 marker",
+		hex: "2f2a4d323630363330412a2f",
+		line: 189,
+		reported: "Greenflagged, GitGuardian and Abnormal AI, 2026-10 and 2026-11"
+	},
+	{
+		kind: "stage 2 marker",
+		hex: "2f2a4e504d5f57535f5348494d2a2f",
+		line: 190,
+		reported: "Greenflagged, 2026-11"
+	},
+	{
+		kind: "stage 2 marker",
+		hex: "2f2a52533236303630352a2f",
+		line: 191,
+		reported: "Greenflagged, GitGuardian and Abnormal AI, 2026-10 and 2026-11"
+	},
+	{
+		kind: "stage 2 marker",
+		hex: "2f2a43323530363137412a2f",
+		line: 192,
+		reported: "Greenflagged, 2026-11"
+	},
+	{
+		kind: "stage 2 marker",
+		hex: "2f2a43323530363138412a2f",
+		line: 193,
+		reported: "Greenflagged, 2026-11"
+	},
+	{
+		kind: "stage 2 marker",
+		hex: "2f2a43323530363139412a2f",
+		line: 194,
+		reported: "Greenflagged, 2026-11"
+	},
+	{
+		kind: "stage 2 marker",
+		hex: "2f2a43323530363230412a2f",
+		line: 195,
+		reported: "Greenflagged, 2026-11"
+	},
+	{
+		kind: "stage 2 marker",
+		hex: "2f2a43323630353131412a2f",
+		line: 196,
+		reported: "Greenflagged, 2026-11"
+	},
+	{
+		kind: "XOR key",
+		hex: "54685a472b306a665845365641474f4a",
+		line: 202,
+		reported: "Greenflagged, 2026-11"
+	},
+	{
+		kind: "payload server",
+		hex: "616363757261736f6674686972652e636f6d",
+		line: 209,
+		reported: "JFrog Security Research, 2026-11"
+	}
+];
+/** How far back a pattern looks from its anchor, at most. */
+const LOOK_BACK = 512;
+const PADDING = 64;
+const PATTERN_MARKERS = [
+	{
+		kind: "fake font command",
+		line: 18,
+		anchor: "fa-solid-",
+		matchAt(text, at) {
+			if (!/^[0-9]{3}\.woff2/.test(text.slice(at + 9, at + 18))) return -1;
+			const limit = Math.max(0, at - LOOK_BACK);
+			let p = at;
+			while (p > limit && !isPathEnd(text.charCodeAt(p - 1))) p--;
+			if (text[p - 1] !== " ") return -1;
+			while (p > limit && text[p - 1] === " ") p--;
+			return text.slice(p - 4, p) === "node" ? p - 4 : -1;
+		}
+	},
+	{
+		kind: "campaign tag",
+		line: 32,
+		anchor: "var z = '-",
+		matchAt(text, at) {
+			if (at < PADDING) return -1;
+			for (let p = at - PADDING; p < at; p++) {
+				const code = text.charCodeAt(p);
+				if (code !== 32 && code !== 9) return -1;
+			}
+			return /^[0-9]+(?:-[0-9]+)?';/.test(text.slice(at + 10, at + 60)) ? at : -1;
+		}
+	},
+	{
+		kind: "campaign tag",
+		line: 45,
+		anchor: "global.i",
+		matchAt(text, at) {
+			return /^ ?= ?['"]A[0-9]{1,2}[-'"]/.test(text.slice(at + 8, at + 16)) ? at : -1;
+		}
+	}
+];
+/** The characters that end a path in a command: a space, a quote or a line break. */
+function isPathEnd(code) {
+	return code === 32 || code === 34 || code === 39 || code === 10 || code === 13;
+}
+// src/checks/code/known-marker.ts
+const knownMarker = {
+	id: "code/known-marker",
+	title: "Known PolinRider marker",
+	severity: "critical",
+	hidesSource: true,
+	description: "The file contains a string proven to come from the PolinRider malware campaign: an obfuscator marker, a campaign tag, an XOR key, a wallet address or another indicator published by the researchers who analysed it. Normal code doesn't contain these, so a match means the file is very likely infected. The list comes from meSingh/polinrider-scanner (MIT license) and is bundled with devsweep, so it works offline. The campaign changes its markers every few weeks, so code/hidden-padding is what catches new variants. Markdown files are skipped, since security write-ups quote these strings.",
+	remediation: "Don't build, run or open the project in your editor until it is cleaned. Remove the injected code, check the file's git history for when and how it was added, and check the other files that commit changed. If you built or ran the project, treat your machine as compromised: rotate tokens and passwords from a clean device. If the file is a security tool or a list of indicators, accept the finding in devsweep.config.json."
+};
+/** Write-ups quote the markers, so Markdown files are left out. */
+const SKIPPED_EXTENSIONS = /* @__PURE__ */ new Set(["md"]);
+function appliesTo(file) {
+	return !SKIPPED_EXTENSIONS.has(extensionOf(file));
+}
+const FIXED_VALUES = FIXED_MARKERS.map((entry) => Buffer.from(entry.hex, "hex").toString("utf8"));
+/** Decoded once, when the module loads. */
+const MARKERS = [...FIXED_MARKERS.map((entry, i) => {
+	const value = FIXED_VALUES[i];
+	return {
+		kind: entry.kind,
+		source: sourceOf("strong.txt", entry.line),
+		find: (text) => text.indexOf(value)
+	};
+}), ...PATTERN_MARKERS.map((pattern) => ({
+	kind: pattern.kind,
+	source: sourceOf("strong-patterns.txt", pattern.line),
+	find: (text) => {
+		const { anchor } = pattern;
+		for (let at = text.indexOf(anchor); at !== -1; at = text.indexOf(anchor, at + 1)) {
+			const start = pattern.matchAt(text, at);
+			if (start !== -1) return start;
+		}
+		return -1;
+	}
+}))];
+/**
+* Every fixed marker and pattern anchor in one regex. A single pass over a clean file rules it
+* out, about three times faster than one indexOf per marker. Only files it matches are searched
+* marker by marker.
+*/
+const ANY_MARKER = new RegExp([...FIXED_VALUES, ...PATTERN_MARKERS.map((pattern) => pattern.anchor)].map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"));
+/**
+* One finding per file, at the first marker in it, naming how many other markers it holds.
+* Each marker is one indexOf over the text, so a file megabytes long stays quick.
+*/
+function analyze$5(file, text) {
+	if (!ANY_MARKER.test(text)) return [];
+	const found = MARKERS.flatMap((marker) => {
+		const at = marker.find(text);
+		return at === -1 ? [] : [{
+			marker,
+			at
+		}];
+	});
+	const first = found.reduce((best, next) => best === void 0 || next.at < best.at ? next : best, void 0);
+	if (!first) return [];
+	const { line, column } = lineAndColumn(text, first.at);
+	let message = `Contains a known PolinRider ${first.marker.kind} at column ${count(column)}, a string from the campaign's malware that normal code doesn't contain.`;
+	if (found.length > 1) message += ` ${plural(found.length - 1, "other known marker")} ${found.length === 2 ? "is" : "are"} in this file too.`;
+	message += ` Source: ${first.marker.source}`;
+	return [createFinding(knownMarker, {
+		file,
+		at: {
+			line,
+			column
+		},
+		subject: first.marker.kind,
+		message
+	})];
+}
+// src/checks/code/propagation-script.ts
+const propagationScript = {
+	id: "code/propagation-script",
+	title: "PolinRider propagation script",
+	severity: "critical",
+	hidesSource: true,
+	description: "The PolinRider malware spreads with batch scripts named temp_auto_push.bat and temp_interactive_push.bat: they rewrite git history and force-push the infection to every repository the infected machine can write to. Either file anywhere in a project is critical. A .gitignore line that is exactly config.bat, temp_auto_push.bat or branch_structure.json is medium: it doesn't mean the payload is here, but suggests a contributor's machine was infected and pushed to this repository.",
+	remediation: "Don't run the script. Delete it, and treat the machine that created it as compromised: rotate its GitHub tokens and SSH keys from a clean device. Check the repository for force pushes (devsweep's repo/force-push-detected rule does this with a GitHub token) and compare recent commits with what their authors remember writing."
+};
+/** The scripts themselves. Matched ignoring case, as Windows does. */
+const SCRIPTS = /* @__PURE__ */ new Set(["temp_auto_push.bat", "temp_interactive_push.bat"]);
+/** Files the scripts create, which an infected machine adds to .gitignore. */
+const IGNORED_ENTRIES = /* @__PURE__ */ new Set([
+	"config.bat",
+	"temp_auto_push.bat",
+	"branch_structure.json"
+]);
+function isScript(file) {
+	return SCRIPTS.has(baseName(file).toLowerCase());
+}
+function isGitignore(file) {
+	return baseName(file) === ".gitignore";
+}
+/** A finding for a propagation script, found by its name alone. */
+function scriptFinding(file) {
+	return createFinding(propagationScript, {
+		file,
+		at: { line: 1 },
+		subject: baseName(file).toLowerCase(),
+		message: `${baseName(file)} is the name of PolinRider's propagation script, which rewrites git history and force-pushes the infection to every repository the infected machine can write to.`
+	});
+}
+/**
+* Reports each .gitignore line that is exactly one of the files the scripts create. A leading
+* slash, which only anchors the entry to this folder, counts as the same entry.
+*/
+function analyzeGitignore(file, text) {
+	const findings = [];
+	forEachLine(text, (line, number) => {
+		const entry = line.trimEnd().replace(/^\//, "");
+		if (!IGNORED_ENTRIES.has(entry)) return;
+		findings.push(createFinding(propagationScript, {
+			file,
+			at: {
+				line: number,
+				column: 1
+			},
+			subject: entry,
+			severity: "medium",
+			message: `This .gitignore ignores ${entry}, a file PolinRider's propagation script creates. That suggests a contributor's machine was infected and pushed to this repository, possibly by rewriting its history. Check for force pushes: devsweep reports them under repo/force-push-detected when it has a GitHub token.`,
+			remediation: "Find the commit that added this line and who pushed it. Ask that contributor to check their machine for PolinRider and rotate their GitHub tokens and SSH keys. Compare the repository's recent history with a copy you trust, then remove the line."
+		}));
+	});
+	return findings;
+}
+// src/checks/code/index.ts
+/** Text files larger than this aren't read. Payload lines can be megabytes long. */
+const MAX_TEXT_BYTES = 8388608;
+/**
+* How much of a file is read first, to tell binary from text: a zero byte in it means binary.
+* Git reads the same amount. It also covers the font check's disguisedFile.HEAD_BYTES.
+*/
+const SNIFF_BYTES = 8e3;
+/**
+* Files read at once, across every project being scanned. Each is read whole, so this also
+* bounds memory: 8 × 8 MiB at most, however many projects --all scans together.
+*/
+const readSlot = limiter(8);
+/**
+* Folders that build tools fill with generated code, at any depth: Next.js, Nuxt, SvelteKit,
+* Turborepo, Vercel, Parcel and Angular caches and output. Nobody edits or reviews them, they are
+* rebuilt from the source the rules already read, and bundled code in them pads lines in ways
+* that look like hiding. An infected config file is still found in the source.
+*/
+const GENERATED_FOLDERS = [
+	".next",
+	".nuxt",
+	".svelte-kit",
+	".turbo",
+	".vercel",
+	".parcel-cache",
+	".angular"
+];
+/**
+* Signs of malicious code planted in a repository, such as the PolinRider campaign's. Every rule
+* reads files as text and never runs them.
+*/
+const codeCheck = {
+	id: "code",
+	description: "Signs of malicious code planted in the repository",
+	rules: [
+		autorunTask,
+		hiddenPadding,
+		disguisedFile,
+		propagationScript,
+		knownMarker
+	],
+	looksFor: [TASKS_FILE, "text files"],
+	run: fileFindings
+};
+/**
+* code/autorun-task, from the tasks.json and settings.json the file loop already read and parsed.
+* Undefined when the file isn't there.
+*/
+function autorunFindings(ctx, tasks, settingsText) {
+	if (tasks === void 0) return [];
+	if (tasks instanceof JsoncParseError) {
+		ctx.warn(`Skipped invalid JSONC: ${tasks.message}`, TASKS_FILE);
+		return [];
+	}
+	const settings = settingsText === void 0 ? void 0 : parseOrError(settingsText);
+	if (settings instanceof JsoncParseError) ctx.warn(`Couldn't read "task.allowAutomaticTasks", invalid JSONC: ${settings.message}`, SETTINGS_FILE);
+	return analyze$8(tasks, { allowAutomaticTasks: settings !== void 0 && !(settings instanceof JsoncParseError) && allowsAutomatic(settings) });
+}
+/**
+* The rules that read every file. The project's files are listed once, and each file is opened
+* once, read, and handed to every rule that applies to it.
+*/
+async function fileFindings(ctx) {
+	const findings = [];
+	/** Commands from tasks.json and package.json files, in lower case, by file. */
+	const commands = [];
+	const fonts = [];
+	let tasks;
+	let settingsText;
+	const check = async (name) => {
+		let file;
+		try {
+			file = await readOnce(path.join(ctx.root, name));
+		} catch (error) {
+			ctx.warn(`Couldn't read this file, so the code rules didn't check it: ${errorMessage(error)}`, name);
+			return;
+		}
+		if (isScript(name)) {
+			ctx.scannedFile();
+			findings.push(scriptFinding(name));
+		}
+		if (isCandidate(name)) {
+			ctx.scannedFile();
+			const bytes = file.bytes.subarray(0, HEAD_BYTES);
+			fonts.push({
+				file: name,
+				head: {
+					bytes,
+					size: file.size
+				}
+			});
+		}
+		if (file.binary) return;
+		if (file.size > 8388608) {
+			ctx.warn(`Skipped: larger than ${MAX_TEXT_BYTES / 1024 / 1024} MiB, so the code rules didn't read it.`, name);
+			return;
+		}
+		ctx.scannedFile();
+		const text = file.bytes.toString("utf8");
+		if (appliesTo$1(name)) findings.push(...analyze$6(name, text));
+		if (appliesTo(name)) findings.push(...analyze$5(name, text));
+		if (isGitignore(name)) findings.push(...analyzeGitignore(name, text));
+		let found;
+		if (name === ".vscode/tasks.json") {
+			tasks = parseOrError(text);
+			found = tasks instanceof JsoncParseError ? [] : taskCommands(tasks);
+		} else {
+			if (name === ".vscode/settings.json") settingsText = text;
+			found = commandsIn(name, text);
+		}
+		if (found.length > 0) commands.push({
+			file: name,
+			commands: found
+		});
+	};
+	const reading = [];
+	const listed = await listFiles(ctx.root, {
+		skipFolders: ctx.skipFolders,
+		skipNames: GENERATED_FOLDERS,
+		readdir: ctx.readdir,
+		onFile: (name) => reading.push(readSlot(() => check(name)))
+	});
+	for (const folder of listed.unreadable) ctx.warn("Couldn't open this folder, so the code rules didn't check it.", folder);
+	await Promise.all(reading);
+	commands.sort((a, b) => compareText(a.file, b.file));
+	findings.push(...autorunFindings(ctx, tasks, settingsText));
+	for (const { file, head } of fonts) {
+		const namedBy = commands.find((source) => namesFile(source.commands, file));
+		findings.push(...analyze$7(file, head, namedBy?.file));
+	}
+	return findings;
+}
+/**
+* Opens a file once. Reads its first bytes, then the rest only when those look like text and
+* the file is within MAX_TEXT_BYTES, so a large video costs one small read.
+*/
+async function readOnce(file) {
+	const handle = await open(file, "r");
+	try {
+		const { size } = await handle.stat();
+		const whole = size <= MAX_TEXT_BYTES;
+		const buffer = Buffer.allocUnsafe(whole ? size : SNIFF_BYTES);
+		let read = await fill(handle, buffer, 0, Math.min(buffer.length, SNIFF_BYTES));
+		const binary = buffer.subarray(0, read).includes(0);
+		if (whole && !binary) read = await fill(handle, buffer, read, buffer.length);
+		return {
+			size,
+			binary,
+			bytes: buffer.subarray(0, read)
+		};
+	} finally {
+		await handle.close();
+	}
+}
+/** Reads into `buffer` from `from` until `to`, or the end of the file. Returns where it stopped. */
+async function fill(handle, buffer, from, to) {
+	let at = from;
+	while (at < to) {
+		const { bytesRead } = await handle.read(buffer, at, to - at, at);
+		if (bytesRead === 0) break;
+		at += bytesRead;
+	}
+	return at;
+}
+/**
+* The commands in a VS Code tasks.json (every string in its tasks) or a package.json (its npm
+* scripts), in lower case. Files that don't parse give none: code/autorun-task already warns
+* about an invalid tasks.json.
+*/
+function commandsIn(file, text) {
+	const name = baseName(file);
+	if (name === "tasks.json" && path.posix.basename(path.posix.dirname(file)) === ".vscode") {
+		const parsed = parseOrError(text);
+		return parsed instanceof JsoncParseError ? [] : taskCommands(parsed);
+	}
+	if (name === "package.json") try {
+		const scripts = JSON.parse(text)?.scripts;
+		if (typeof scripts !== "object" || scripts === null) return [];
+		return Object.values(scripts).flatMap((v) => typeof v === "string" ? [v.toLowerCase()] : []);
+	} catch {
+		return [];
+	}
+	return [];
+}
+/** Settings may be written flat (`"task.allowAutomaticTasks"`) or nested (`"task": { … }`). */
+function allowsAutomatic(settings) {
+	const value = field(settings, "task.allowAutomaticTasks")?.value ?? field(field(settings, "task")?.value, "allowAutomaticTasks")?.value;
+	return value?.kind === "string" && value.value === "on";
+}
+/** Every string in a tasks.json's tasks, in lower case. */
+function taskCommands(tasks) {
+	return allStrings(field(tasks, "tasks")?.value).map((s) => s.toLowerCase());
+}
+/** The parsed JSONC, or the parse error when it isn't JSONC. */
+function parseOrError(text) {
+	try {
+		return parseJsonc(text);
+	} catch (error) {
+		if (error instanceof JsoncParseError) return error;
+		throw error;
+	}
 }
 const VERSION = createRequire(import.meta.url)("../package.json").version;
 // src/github/client.ts
@@ -3345,91 +5136,6 @@ async function describeFailure(response) {
 /** Encodes a route segment such as a branch name, keeping the slashes GitHub expects. */
 function segment(value) {
 	return encodeURIComponent(value).replaceAll("%2F", "/");
-}
-// src/github/repository.ts
-const NAME = /^[A-Za-z0-9_.-]+$/;
-const GITHUB_HOSTS = /* @__PURE__ */ new Set([
-	"github.com",
-	"www.github.com",
-	"ssh.github.com"
-]);
-/**
-* Which GitHub repository the scan is about: the github.com origin remote of the git repository
-* that contains `root`, or else GITHUB_REPOSITORY. The remote comes first because a workflow can
-* check out and scan a different repository than the one it runs in, which is what
-* GITHUB_REPOSITORY names. On GitHub Enterprise Server the remote isn't on github.com, so there
-* GITHUB_REPOSITORY is used.
-*/
-async function findGitHubRepository(root, env) {
-	const url = await originUrl(root);
-	return (url === void 0 ? void 0 : parseRemoteUrl(url)) ?? parseSlug(env.GITHUB_REPOSITORY);
-}
-function parseSlug(value) {
-	const [owner, repo, ...rest] = (value ?? "").split("/");
-	if (!owner || !repo || rest.length > 0 || !NAME.test(owner) || !NAME.test(repo)) return;
-	return {
-		owner,
-		repo
-	};
-}
-/**
-* Reads owner and repo from a github.com remote URL in any of git's forms. The URL itself is never
-* shown anywhere, because an HTTPS remote can contain a token.
-*/
-function parseRemoteUrl(url) {
-	let host;
-	let pathname;
-	const scp = /^(?:[^@/]+@)?([^:/]+):(?!\/)(.+)$/.exec(url.trim());
-	if (scp?.[1] && scp[2] && !url.includes("://")) {
-		host = scp[1];
-		pathname = scp[2];
-	} else try {
-		const parsed = new URL(url.trim());
-		host = parsed.hostname;
-		pathname = parsed.pathname;
-	} catch {
-		return;
-	}
-	if (!GITHUB_HOSTS.has(host.toLowerCase())) return void 0;
-	return parseSlug(pathname.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/, ""));
-}
-/** The origin remote's URL from the repository's git config, without running git. */
-async function originUrl(root) {
-	const repository = await findRepository(root);
-	if (!repository) return void 0;
-	const config = await readGitConfig(path.join(repository.root, ".git"));
-	return config === void 0 ? void 0 : remoteUrl(config, "origin");
-}
-/** `.git` is a folder in a normal clone, and a file pointing elsewhere in worktrees and submodules. */
-async function readGitConfig(dotGit) {
-	let gitDir = dotGit;
-	try {
-		const pointer = /^gitdir:\s*(.+)$/m.exec(await readFile(dotGit, "utf8"));
-		if (pointer?.[1]) gitDir = path.resolve(path.dirname(dotGit), pointer[1].trim());
-	} catch {}
-	try {
-		const common = (await readFile(path.join(gitDir, "commondir"), "utf8")).trim();
-		gitDir = path.resolve(gitDir, common);
-	} catch {}
-	try {
-		return await readFile(path.join(gitDir, "config"), "utf8");
-	} catch {
-		return;
-	}
-}
-/** Finds `url` in a `[remote "<name>"]` section of a git config file. */
-function remoteUrl(config, name) {
-	let inSection = false;
-	for (const raw of config.split(/\r?\n/)) {
-		const line = raw.trim();
-		const section = /^\[\s*([^\s\]]+)(?:\s+"(.*)")?\s*\]$/.exec(line);
-		if (section) {
-			inSection = section[1]?.toLowerCase() === "remote" && section[2] === name;
-			continue;
-		}
-		const entry = /^url\s*=\s*(.*)$/i.exec(line);
-		if (inSection && entry?.[1]) return entry[1].replace(/^"(.*)"$/, "$1").trim();
-	}
 }
 // src/checks/repo/api.ts
 /** Why a request failed, in words that suggest what to do about it. */
@@ -3592,7 +5298,7 @@ const repoCheck = {
 	network: true,
 	async run(ctx) {
 		if (ctx.offline) return [];
-		const ref = await findGitHubRepository(ctx.root, ctx.env);
+		const ref = await ctx.repository();
 		if (!ref) {
 			ctx.warn(`Couldn't check GitHub repository settings: no GitHub repository found. Set GITHUB_REPOSITORY to owner/repo, or add an origin remote on github.com. ${SKIP_HINT}`);
 			return [];
@@ -3616,6 +5322,7 @@ const repoCheck = {
 			ctx.warn(`Couldn't check GitHub repository settings for ${slug}: ${reason(error)}`);
 			return [];
 		}
+		ctx.scannedGitHub();
 		const gh = {
 			api,
 			base,
@@ -3626,15 +5333,6 @@ const repoCheck = {
 		return [...allowed, ...detected];
 	}
 };
-// src/compare.ts
-/**
-* Orders text by character code, so "B" comes before "a". Unlike localeCompare, the result
-* doesn't depend on the language settings of the machine.
-*/
-function compareText(a, b) {
-	if (a < b) return -1;
-	return a > b ? 1 : 0;
-}
 // src/checks/workflows/shell.ts
 /** Splits a script into logical lines, located in the workflow file. */
 function scriptLines(script) {
@@ -10726,13 +12424,13 @@ const rules$1 = [unpinnedAction];
 */
 const GITHUB_OWNED = /* @__PURE__ */ new Set(["actions", "github"]);
 const FULL_SHA = /^[0-9a-f]{40}$/i;
-function analyze$1(workflow) {
+function analyze$1(workflow, context = {}) {
 	return workflow.jobs.flatMap((job) => [...job.uses ? [job.uses] : [], ...job.steps.flatMap((step) => step.uses ? [step.uses] : [])]).flatMap((uses) => {
-		const problem = describeProblem(uses.value);
+		const problem = describeProblem(uses.value, context.owner);
 		return problem ? [finding(workflow, uses, problem)] : [];
 	});
 }
-function describeProblem(uses) {
+function describeProblem(uses, repoOwner) {
 	if (uses.startsWith("./")) return void 0;
 	if (uses.startsWith("docker://")) {
 		if (uses.includes("@sha256:")) return void 0;
@@ -10746,8 +12444,10 @@ function describeProblem(uses) {
 	const ref = at === -1 ? "" : uses.slice(at + 1);
 	const owner = name.split("/")[0]?.toLowerCase() ?? "";
 	if (GITHUB_OWNED.has(owner) || FULL_SHA.test(ref)) return void 0;
+	const own = repoOwner !== void 0 && owner === repoOwner.toLowerCase();
+	const label = own ? `Action "${name}" is your organisation's own, but it` : `Third-party action "${name}"`;
 	return {
-		message: ref ? `Third-party action "${name}" is pinned to "${ref}", a tag or branch its owner can move.` : `Third-party action "${name}" has no version, so it can change at any time.`,
+		message: ref ? `${label} is pinned to "${ref}", a tag or branch ${own ? "anyone with write access to it" : "its owner"} can move.` : `${label} has no version, so it can change at any time.`,
 		remediation: `Pin it to a full commit SHA: uses: ${name}@<40-character-sha>${ref ? ` # ${ref}` : ""}`
 	};
 }
@@ -10774,6 +12474,7 @@ const workflowsCheck = {
 	id: "workflows",
 	description: "Risky GitHub Actions workflow settings",
 	rules: analyzers.flatMap((a) => a.rules),
+	looksFor: [`${WORKFLOWS_DIR}/*.yml`, `${WORKFLOWS_DIR}/*.yaml`],
 	async run(ctx) {
 		const dir = path.join(ctx.root, WORKFLOWS_DIR);
 		let entries;
@@ -10783,7 +12484,8 @@ const workflowsCheck = {
 			if (isMissing(error)) return [];
 			throw error;
 		}
-		const parsing = entries.filter((entry) => entry.isFile() && WORKFLOW_FILE.test(entry.name)).map((entry) => entry.name).sort(compareText).map((name) => {
+		const names = entries.filter((entry) => entry.isFile() && WORKFLOW_FILE.test(entry.name)).map((entry) => entry.name).sort(compareText);
+		const parsing = names.map((name) => {
 			const file = `${WORKFLOWS_DIR}/${name}`;
 			return {
 				file,
@@ -10791,6 +12493,8 @@ const workflowsCheck = {
 			};
 		});
 		await Promise.allSettled(parsing.map((p) => p.workflow));
+		const owner = names.length > 0 ? (await ctx.repository())?.owner : void 0;
+		const context = owner ? { owner } : {};
 		const findings = [];
 		for (const { file, workflow: parsed } of parsing) {
 			let workflow;
@@ -10798,23 +12502,25 @@ const workflowsCheck = {
 				workflow = await parsed;
 			} catch (error) {
 				if (!(error instanceof WorkflowParseError)) throw error;
+				ctx.scannedFile();
 				ctx.warn(`Skipped invalid YAML: ${error.message}`, file);
 				continue;
 			}
-			if (workflow) findings.push(...analyze(workflow));
+			ctx.scannedFile();
+			if (workflow) findings.push(...analyze(workflow, context));
 		}
 		return findings;
 	}
 };
-function analyze(workflow) {
-	return analyzers.flatMap((a) => a.analyze(workflow));
-}
-function isMissing(error) {
-	const code = error?.code;
-	return code === "ENOENT" || code === "ENOTDIR";
+function analyze(workflow, context) {
+	return analyzers.flatMap((a) => a.analyze(workflow, context));
 }
 // src/checks/index.ts
-const checks = [workflowsCheck, repoCheck];
+const checks = [
+	workflowsCheck,
+	repoCheck,
+	codeCheck
+];
 const rules = checks.flatMap((check) => check.rules);
 // src/ui/terminal.ts
 /** Terminal escape sequences and helpers shared by the animations. */
@@ -10861,6 +12567,17 @@ function printable(text, oneLine = false) {
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
+/**
+* Shortens `text` with "…" to fit the columns left after `used`, so the line never wraps. Keeps
+* the start or the end of the text. Empty when there is no room at all.
+*/
+function fitWidth(text, width, used, keep) {
+	if (width === void 0) return text;
+	const room = width - used - 1;
+	if (room < 4) return "";
+	if (text.length <= room) return text;
+	return keep === "start" ? `${text.slice(0, room - 1)}…` : `…${text.slice(text.length - room + 1)}`;
+}
 // src/reporters/source.ts
 /** Reads scanned files on demand, relative to the scan root, and remembers them. */
 function sourceReader(root) {
@@ -10887,6 +12604,10 @@ function markedSpan(text, column) {
 }
 // src/reporters/pretty.ts
 const TITLES = new Map(rules.map((rule) => [rule.id, rule.title]));
+/** Rules whose findings may point at malicious code: their lines are never printed. */
+const HIDES_SOURCE = new Set(rules.filter((rule) => rule.hidesSource).map((rule) => rule.id));
+/** Shown in place of the code excerpt for those rules. */
+const SOURCE_HIDDEN_NOTE = "The line isn't shown here, since it may hold malicious code. Open the file in a plain text editor to read it.";
 const DOT = "●";
 const SEVERITY_WIDTH = Math.max(...SEVERITIES.map((s) => s.length));
 /** Upper bound for wrapped text, so details stay readable on very wide terminals. */
@@ -10899,29 +12620,79 @@ const MIN_TEXT_WIDTH = 20;
 */
 function formatPretty(result, options) {
 	const c = import_picocolors.default.createColors(options.color);
-	const paint = {
+	const paint = painter(c);
+	const lines = header(`Results for ${options.target}`, options.target, c, options.showName);
+	lines.push(...resultBody(result, columnWidths(result.findings), c, paint, options));
+	lines.push(...summary(result, c, paint, options.details ?? false, options.width));
+	return `${lines.join("\n")}\n`;
+}
+/** Shown once at the top of every `--all` report. */
+const ALL_OFFLINE_NOTE = "Network checks are off with --all, as if --offline were passed: checking the GitHub settings of dozens of repositories would hit GitHub’s rate limit. Scan one repository without --all to include them.";
+/** How many unreadable folders the readable report names. JSON lists them all. */
+const UNREADABLE_SHOWN = 5;
+/**
+* The readable `--all` report: findings grouped by project, then by file, and one summary for
+* everything. Projects with nothing to report are counted but not listed.
+*/
+function formatPrettyAll(all, options) {
+	const c = import_picocolors.default.createColors(options.color);
+	const paint = painter(c);
+	const width = options.width;
+	const inner = {
+		...options,
+		width: width === void 0 ? void 0 : width - 2
+	};
+	const lines = header(`Results for every project under ${options.target}`, `${options.target}  · every project`, c, options.showName);
+	lines.push(...wrap(ALL_OFFLINE_NOTE, textWidthAfter(2, width)).map((l) => c.dim(`  ${l}`)), "");
+	const shown = all.projects.filter(({ result }) => result.findings.length + result.warnings.length + result.errors.length > 0);
+	const columns = columnWidths(shown.flatMap(({ result }) => result.findings));
+	for (const { path: projectPath, result } of shown) {
+		const name = projectPath === "." ? ". (the folder itself)" : printable(projectPath, true);
+		lines.push(`  ${c.bold(c.cyan(name))}`);
+		const body = resultBody(result, columns, c, paint, {
+			...inner,
+			readLines: options.readerFor?.(result.root)
+		});
+		lines.push(...body.map((line) => line ? `  ${line}` : line));
+	}
+	if (all.unreadable.length > 0) {
+		const unreadableCount = all.unreadable.length;
+		const names = all.unreadable.slice(0, UNREADABLE_SHOWN).map((dir) => `    ${printable(dir, true)}`);
+		lines.push(...notice(c.yellow("!"), `${plural(unreadableCount, "folder")} couldn't be opened and ${unreadableCount === 1 ? "was" : "were"} skipped, usually for lack of permission:`, width), ...names);
+		if (unreadableCount > UNREADABLE_SHOWN) lines.push(c.dim(`    …and ${unreadableCount - UNREADABLE_SHOWN} more (--json lists them all)`));
+		lines.push("");
+	}
+	lines.push(...summaryAll(all, c, paint, options.details ?? false, width));
+	return `${lines.join("\n")}\n`;
+}
+function painter(c) {
+	return {
 		critical: (text) => c.bold(c.red(text)),
 		high: c.red,
 		medium: c.yellow,
 		low: c.cyan
 	};
-	const groups = groupByFile(result.findings);
-	const width = options.width;
-	const columns = columnWidths(result.findings);
-	const lines = options.showName === false ? [`  ${c.dim(`Results for ${options.target}`)}`, ""] : [
+}
+/** The report's first lines. Without the banner on screen, it names devsweep too. */
+function header(withBanner, withoutBanner, c, showName) {
+	return showName === false ? [`  ${c.dim(withBanner)}`, ""] : [
 		"",
-		`  ${c.bold(c.cyan("devsweep"))}  ${c.dim(options.target)}`,
+		`  ${c.bold(c.cyan("devsweep"))}  ${c.dim(withoutBanner)}`,
 		""
 	];
-	for (const group of groups) {
+}
+/** Findings grouped by file, then warnings and errors. Ends with a blank line when not empty. */
+function resultBody(result, columns, c, paint, options) {
+	const width = options.width;
+	const lines = [];
+	for (const group of groupByFile(result.findings)) {
 		lines.push(`  ${group.file === void 0 ? c.bold("GitHub repository settings") : formatPath(group.file, c)}`);
 		if (options.details) lines.push("", ...group.findings.flatMap((f) => detailed(f, c, paint, options)));
 		else lines.push(...compact(group.findings, columns, c, paint, width), "");
 	}
-	const notices = [...result.warnings.map((w) => `  ${c.yellow("!")} ${truncate(printable(`${w.file ? `${w.file}  ` : ""}${firstLine(w.message)}`, true), width, 4)}`), ...result.errors.map((e) => `  ${c.red("×")} ${truncate(printable(`check "${e.checkId}" failed: ${firstLine(e.message)}`, true), width, 4)}`)];
+	const notices = [...result.warnings.flatMap((w) => notice(c.yellow("!"), w.message, width, w.file || void 0)), ...result.errors.flatMap((e) => notice(c.red("×"), e.checkId === "config" ? e.message : `check "${e.checkId}" failed: ${e.message}`, width))];
 	if (notices.length > 0) lines.push(...notices, "");
-	lines.push(...summary(result, c, paint, options.details ?? false));
-	return `${lines.join("\n")}\n`;
+	return lines;
 }
 /** One line per finding: severity, line number, title and a short subject. */
 function compact(findings, columns, c, paint, width) {
@@ -10940,11 +12711,14 @@ function columnWidths(findings) {
 }
 /** The explanation, a code excerpt pointing at the problem, and the fix. */
 function detailed(f, c, paint, options) {
-	const textWidth = Math.max(Math.min(options.width ?? MAX_TEXT_WIDTH, MAX_TEXT_WIDTH) - 6, MIN_TEXT_WIDTH);
+	const textWidth = textWidthAfter(6, options.width);
 	const indent = (text) => `      ${text}`;
 	const lines = [`    ${paint[f.severity](`${DOT} ${f.severity}`)}  ${c.bold(title(f))}${f.line ? c.dim(`  line ${f.line}`) : ""}`, ...wrap(printable(f.message), textWidth).map(indent)];
-	const excerpt = codeExcerpt(f, options.readLines, textWidth, c, paint[f.severity]);
-	if (excerpt.length > 0) lines.push("", ...excerpt.map(indent));
+	if (HIDES_SOURCE.has(f.ruleId)) lines.push("", ...wrap(SOURCE_HIDDEN_NOTE, textWidth).map((line) => indent(c.dim(line))));
+	else {
+		const excerpt = codeExcerpt(f, options.readLines, textWidth, c, paint[f.severity]);
+		if (excerpt.length > 0) lines.push("", ...excerpt.map(indent));
+	}
 	if (f.remediation) {
 		const fix = wrap(`Fix: ${printable(f.remediation)}`, textWidth);
 		lines.push("", ...fix.map((line, i) => indent(i === 0 ? line.replace(/^Fix:/, c.green("Fix:")) : line)));
@@ -10975,26 +12749,97 @@ function codeExcerpt(f, readLines, textWidth, c, paint) {
 	if (to > from) lines.push(`${c.dim(`${" ".repeat(gutter)} │`)} ${" ".repeat(from)}${paint("^".repeat(to - from))}`);
 	return lines;
 }
-function summary(result, c, paint, details) {
-	const accepted = result.accepted.length;
-	const warned = result.warnings.length;
-	const extra = [
-		accepted > 0 ? c.dim(`· ${accepted} accepted`) : "",
-		warned > 0 ? c.yellow(`· ${warned} ${warned === 1 ? "warning" : "warnings"}`) : "",
-		c.dim(`· ${result.durationMs} ms`)
-	].filter(Boolean).map((part) => `  ${part}`).join("");
-	const failed = result.errors.length;
-	const lines = failed > 0 ? [`  ${c.red("×")} ${c.bold("Scan incomplete:")} ${failed} ${failed === 1 ? "check" : "checks"} failed, so some issues may be missing.`] : [];
-	const counts = summarize(result.findings);
-	if (counts.total === 0) {
-		lines.push(`  ${failed > 0 ? c.dim(DOT) : c.green(DOT)} No issues found${extra}`);
-		return lines;
+/**
+* A warning or error, word-wrapped like the details text, with later lines indented under the
+* text. A file name comes first, set off by two spaces.
+*/
+function notice(mark, message, width, file) {
+	const room = textWidthAfter(4, width);
+	const body = printable(firstLine(message), true);
+	const name = file === void 0 ? void 0 : printable(file, true);
+	let lines;
+	if (name === void 0) lines = wrap(body, room);
+	else {
+		lines = wrap(`${name} ${body}`, room - 1);
+		const first = lines[0];
+		if (first?.startsWith(`${name} `)) lines[0] = `${name}  ${first.slice(name.length + 1)}`;
 	}
+	return lines.map((line, i) => `${i === 0 ? `  ${mark} ` : "    "}${line}`);
+}
+/** Room for wrapped text after `indent` columns, within the bounds above. */
+function textWidthAfter(indent, width) {
+	return Math.max(Math.min(width ?? MAX_TEXT_WIDTH, MAX_TEXT_WIDTH) - indent, MIN_TEXT_WIDTH);
+}
+/**
+* Says what was scanned when it wasn't the files: either nothing at all, or only the settings on
+* GitHub. Undefined when files were read, or when a check crashed (the summary says so already).
+*/
+function coverageNote(result) {
+	const coverage = result.coverage;
+	if (!coverage || coverage.filesRead || result.errors.length > 0) return void 0;
+	const lookedFor = coverage.lookedFor.length > 0 ? `devsweep looks for ${list(coverage.lookedFor)}, and found none here.` : "";
+	if (coverage.github) return {
+		nothing: false,
+		text: `Only the GitHub repository settings were checked. ${lookedFor}`.trim()
+	};
+	return {
+		nothing: true,
+		text: lookedFor
+	};
+}
+function summary(result, c, paint, details, width) {
+	const failed = result.errors.length;
+	const lines = failed > 0 ? [`  ${c.red("×")} ${c.bold("Scan incomplete:")} ${plural(failed, "check")} failed, so some issues may be missing.`] : [];
+	const note = coverageNote(result);
+	lines.push(...totals(result.findings, {
+		accepted: result.accepted.length,
+		warned: result.warnings.length,
+		failed: failed > 0,
+		duration: `${result.durationMs} ms`,
+		nothing: note?.nothing ?? false,
+		note: note?.text ? wrap(note.text, textWidthAfter(2, width)).map((l) => c.dim(`  ${l}`)) : []
+	}, c, paint, details));
+	return lines;
+}
+/** The issue counts by severity, or "No issues found", then the --details hint. */
+function totals(findings, t, c, paint, details) {
+	const extra = [
+		t.accepted > 0 ? c.dim(`· ${count(t.accepted)} accepted`) : "",
+		t.warned > 0 ? c.yellow(`· ${plural(t.warned, "warning")}`) : "",
+		t.duration ? c.dim(`· ${t.duration}`) : ""
+	].filter(Boolean).map((part) => `  ${part}`).join("");
+	const note = t.note ?? [];
+	const counts = summarize(findings);
+	if (counts.total === 0) return [t.nothing && t.accepted === 0 ? `  ${c.dim(DOT)} Nothing to scan${extra}` : `  ${t.failed ? c.dim(DOT) : c.green(DOT)} No issues found${extra}`, ...note];
 	const bySeverity = SEVERITIES.filter((s) => counts[s] > 0).map((s) => paint[s](`${counts[s]} ${s}`));
-	const issues = c.bold(`${counts.total} ${counts.total === 1 ? "issue" : "issues"}`);
-	lines.push(`  ${issues}  ${bySeverity.join("  ")}${extra}`);
+	const lines = [`  ${c.bold(plural(counts.total, "issue"))}  ${bySeverity.join("  ")}${extra}`, ...note];
 	if (!details) lines.push(c.dim("  Add --details to see why each one matters and how to fix it."));
 	return lines;
+}
+/**
+* "Scanned 42 projects, 3 with findings, 2 folders couldn't be opened", then the issue counts
+* across every project.
+*/
+function summaryAll(all, c, paint, details, width) {
+	const results = all.projects.map((project) => project.result);
+	const searched = c.dim(`  · ${plural(all.foldersSearched, "folder")} searched  · ${formatDuration(all.durationMs)}`);
+	const unreadable = all.unreadable.length > 0 ? `, ${plural(all.unreadable.length, "folder")} couldn't be opened` : "";
+	if (results.length === 0) return [`  ${c.dim(DOT)} No projects found${unreadable}${searched}`, ...wrap(`devsweep looks for folders that contain ${list(PROJECT_MARKERS, "or")}, and found none here.`, textWidthAfter(2, width)).map((l) => c.dim(`  ${l}`))];
+	const lines = [];
+	const failed = results.filter((r) => r.errors.length > 0).length;
+	if (failed > 0) lines.push(`  ${c.red("×")} ${c.bold("Scan incomplete:")} ${plural(failed, "project")} had a check fail or a broken config file, so some issues may be missing.`);
+	const withFindings = results.filter((r) => r.findings.length > 0).length;
+	lines.push(`  ${c.bold(`Scanned ${plural(results.length, "project")}`)}, ${withFindings === 0 ? "none" : withFindings} with findings${unreadable}${searched}`);
+	lines.push(...totals(results.flatMap((r) => r.findings), {
+		accepted: results.reduce((sum, r) => sum + r.accepted.length, 0),
+		warned: results.reduce((sum, r) => sum + r.warnings.length, 0),
+		failed: failed > 0
+	}, c, paint, details));
+	return lines;
+}
+/** "840 ms", "4.2 s". */
+function formatDuration(ms) {
+	return ms < 1e3 ? `${ms} ms` : `${(ms / 1e3).toFixed(1)} s`;
 }
 /** Groups findings by file. Files with the most severe findings come first. */
 function groupByFile(findings) {
@@ -11210,6 +13055,91 @@ function toUri(file) {
 function escapeMarkdown(text) {
 	return text.replace(/[\\`*_[\]<>|]/g, "\\$&");
 }
+// src/github/repository.ts
+const NAME = /^[A-Za-z0-9_.-]+$/;
+const GITHUB_HOSTS = /* @__PURE__ */ new Set([
+	"github.com",
+	"www.github.com",
+	"ssh.github.com"
+]);
+/**
+* Which GitHub repository the scan is about: the github.com origin remote of the git repository
+* that contains `root`, or else GITHUB_REPOSITORY. The remote comes first because a workflow can
+* check out and scan a different repository than the one it runs in, which is what
+* GITHUB_REPOSITORY names. On GitHub Enterprise Server the remote isn't on github.com, so there
+* GITHUB_REPOSITORY is used.
+*/
+async function findGitHubRepository(root, env) {
+	const url = await originUrl(root);
+	return (url === void 0 ? void 0 : parseRemoteUrl(url)) ?? parseSlug(env.GITHUB_REPOSITORY);
+}
+function parseSlug(value) {
+	const [owner, repo, ...rest] = (value ?? "").split("/");
+	if (!owner || !repo || rest.length > 0 || !NAME.test(owner) || !NAME.test(repo)) return;
+	return {
+		owner,
+		repo
+	};
+}
+/**
+* Reads owner and repo from a github.com remote URL in any of git's forms. The URL itself is never
+* shown anywhere, because an HTTPS remote can contain a token.
+*/
+function parseRemoteUrl(url) {
+	let host;
+	let pathname;
+	const scp = /^(?:[^@/]+@)?([^:/]+):(?!\/)(.+)$/.exec(url.trim());
+	if (scp?.[1] && scp[2] && !url.includes("://")) {
+		host = scp[1];
+		pathname = scp[2];
+	} else try {
+		const parsed = new URL(url.trim());
+		host = parsed.hostname;
+		pathname = parsed.pathname;
+	} catch {
+		return;
+	}
+	if (!GITHUB_HOSTS.has(host.toLowerCase())) return void 0;
+	return parseSlug(pathname.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/, ""));
+}
+/** The origin remote's URL from the repository's git config, without running git. */
+async function originUrl(root) {
+	const repository = await findRepository(root);
+	if (!repository) return void 0;
+	const config = await readGitConfig(path.join(repository.root, ".git"));
+	return config === void 0 ? void 0 : remoteUrl(config, "origin");
+}
+/** `.git` is a folder in a normal clone, and a file pointing elsewhere in worktrees and submodules. */
+async function readGitConfig(dotGit) {
+	let gitDir = dotGit;
+	try {
+		const pointer = /^gitdir:\s*(.+)$/m.exec(await readFile(dotGit, "utf8"));
+		if (pointer?.[1]) gitDir = path.resolve(path.dirname(dotGit), pointer[1].trim());
+	} catch {}
+	try {
+		const common = (await readFile(path.join(gitDir, "commondir"), "utf8")).trim();
+		gitDir = path.resolve(gitDir, common);
+	} catch {}
+	try {
+		return await readFile(path.join(gitDir, "config"), "utf8");
+	} catch {
+		return;
+	}
+}
+/** Finds `url` in a `[remote "<name>"]` section of a git config file. */
+function remoteUrl(config, name) {
+	let inSection = false;
+	for (const raw of config.split(/\r?\n/)) {
+		const line = raw.trim();
+		const section = /^\[\s*([^\s\]]+)(?:\s+"(.*)")?\s*\]$/.exec(line);
+		if (section) {
+			inSection = section[1]?.toLowerCase() === "remote" && section[2] === name;
+			continue;
+		}
+		const entry = /^url\s*=\s*(.*)$/i.exec(line);
+		if (inSection && entry?.[1]) return entry[1].replace(/^"(.*)"$/, "$1").trim();
+	}
+}
 // src/scanner.ts
 var ScanTargetError = class extends Error {};
 /** Rejects with ScanTargetError for a bad path, or ConfigError for a bad config file. */
@@ -11223,17 +13153,34 @@ async function scan(options) {
 	const errors = [];
 	const offline = options.offline ?? false;
 	const skipped = offline ? checks$1.filter((check) => check.network) : [];
-	const configured = applyConfig((await Promise.all(checks$1.filter((check) => !skipped.includes(check)).map(async (check) => {
+	const active = checks$1.filter((check) => !skipped.includes(check));
+	let filesRead = false;
+	const env = options.env ?? process.env;
+	let repository;
+	let scannedGitHub = false;
+	const configured = applyConfig((await Promise.all(active.map(async (check) => {
 		try {
 			return await check.run({
 				root,
+				skipFolders: options.skipFolders,
+				readdir: options.readdir,
 				warn: (message, file) => warnings.push({
 					checkId: check.id,
 					message,
 					...file !== void 0 && { file }
 				}),
+				scannedFile: () => {
+					filesRead = true;
+				},
+				scannedGitHub: () => {
+					scannedGitHub = true;
+				},
 				offline,
-				env: options.env ?? process.env,
+				repository: () => {
+					repository ??= findGitHubRepository(root, env);
+					return repository;
+				},
+				env,
 				fetch: options.fetch ?? globalThis.fetch
 			});
 		} catch (error) {
@@ -11257,6 +13204,11 @@ async function scan(options) {
 		warnings,
 		errors,
 		durationMs: Math.round(performance.now() - started),
+		coverage: {
+			filesRead,
+			lookedFor: active.flatMap((check) => check.looksFor ?? []),
+			github: scannedGitHub
+		},
 		...Object.keys(config.severity).length > 0 && { severityOverrides: { ...config.severity } }
 	};
 }
@@ -11281,6 +13233,7 @@ function notFullyChecked(checks, skipped, warnings, errors) {
 function compareFindings(a, b) {
 	return SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity) || compareText(a.file ?? "", b.file ?? "") || (a.line ?? 0) - (b.line ?? 0) || (a.column ?? 0) - (b.column ?? 0) || compareText(a.ruleId, b.ruleId) || compareText(a.subject ?? "", b.subject ?? "");
 }
+/** Rejects with ScanTargetError when `root` is missing or not a folder. */
 async function assertDirectory(root) {
 	let isDirectory;
 	try {
@@ -11289,6 +13242,87 @@ async function assertDirectory(root) {
 		throw new ScanTargetError(`Path does not exist: ${root}`);
 	}
 	if (!isDirectory) throw new ScanTargetError(`Path is not a directory: ${root}`);
+}
+// src/scan-all.ts
+/** Projects scanned at once. Each scan is quick and mostly waits on the disk. */
+const PROJECT_CONCURRENCY = 4;
+/**
+* Finds every project under a folder and scans each one with its own devsweep.config.json.
+*
+* Network checks are always skipped, as with --offline: one GitHub API call per check per
+* project would use up the API's hourly limit after a few dozen repositories.
+*
+* Rejects with ScanTargetError when the folder is missing or can't be read. A problem inside one
+* project, such as a broken config file, becomes an error in that project's result instead.
+*/
+async function scanAll(options) {
+	const started = performance.now();
+	const root = path.resolve(options.root);
+	await assertDirectory(root);
+	let found;
+	try {
+		found = await findProjects(root, { onProgress: (p) => options.onProgress?.({
+			stage: "searching",
+			...p
+		}) });
+	} catch (error) {
+		throw new ScanTargetError(`Couldn't open ${root}: ${errorMessage(error)}`);
+	}
+	let done = 0;
+	return {
+		root,
+		projects: await mapLimit(found.projects, PROJECT_CONCURRENCY, async (dir) => {
+			const shown = toSlashes(path.relative(root, dir)) || ".";
+			options.onProgress?.({
+				stage: "scanning",
+				done,
+				total: found.projects.length,
+				project: shown
+			});
+			const result = await scanProject(dir, nestedIn(dir, found.projects), options.env, found.readdir);
+			done++;
+			return {
+				path: shown,
+				result
+			};
+		}),
+		foldersSearched: found.folders,
+		unreadable: found.unreadable,
+		durationMs: Math.round(performance.now() - started)
+	};
+}
+/**
+* The projects inside `dir`, as paths from `dir` with forward slashes. Each is scanned as its own
+* project, so the scan of `dir` leaves their folders out: otherwise every file in a nested
+* project would be read twice and its findings reported under both projects.
+*/
+function nestedIn(dir, projects) {
+	const prefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
+	return projects.filter((other) => other.startsWith(prefix)).map((other) => toSlashes(other.slice(prefix.length)));
+}
+/** Scans one project. A scan that can't start becomes a result with one error, not a crash. */
+async function scanProject(root, skipFolders, env, readdir) {
+	try {
+		return await scan({
+			root,
+			skipFolders,
+			offline: true,
+			env,
+			readdir
+		});
+	} catch (error) {
+		return {
+			root,
+			findings: [],
+			accepted: [],
+			warnings: [],
+			errors: [{
+				checkId: error instanceof ConfigError ? "config" : "scan",
+				message: errorMessage(error)
+			}],
+			durationMs: 0
+		};
+	}
 }
 // src/ui/banner.ts
 /** Block letters in the "ANSI Shadow" style. The box-drawing strokes form the shadow. */
@@ -11526,6 +13560,52 @@ function tagline(options) {
 	const text = `supply-chain & credential risk scanner · v${options.version}`;
 	return `${" ".repeat(INDENT)}${options.color ? `\u001b[38;5;244m${text}\u001b[0m` : text}`;
 }
+// src/ui/progress.ts
+const SPINNER = [
+	"⠋",
+	"⠙",
+	"⠹",
+	"⠸",
+	"⠼",
+	"⠴",
+	"⠦",
+	"⠧",
+	"⠇",
+	"⠏"
+];
+/** Columns used before the text: indent, spinner, "devsweep" and gaps. */
+const PREFIX$1 = 14;
+/**
+* One line that rewrites itself in place while a long job runs:
+*
+*   ⠹ devsweep  searching  12,345 folders · 42 projects found
+*
+* Only for an interactive terminal. In CI or a pipe, the redraws would pile up as separate lines.
+*/
+function startProgress(options) {
+	const c = import_picocolors.default.createColors(options.color);
+	const frameMs = options.frameMs ?? 80;
+	const started = Date.now();
+	let drawnAt = 0;
+	const draw = () => {
+		drawnAt = Date.now();
+		const frame = SPINNER[Math.floor((Date.now() - started) / frameMs) % SPINNER.length];
+		options.write(`${CLEAR_LINE}  ${c.cyan(frame ?? "")} ${c.bold(c.cyan("devsweep"))}  ${c.dim(fitWidth(printable(options.text(), true), options.width, PREFIX$1, "start"))}`);
+	};
+	const restoreCursor = hideCursor(options.write);
+	draw();
+	const timer = setInterval(draw, frameMs);
+	return {
+		update() {
+			if (Date.now() - drawnAt >= frameMs) draw();
+		},
+		stop() {
+			clearInterval(timer);
+			options.write(CLEAR_LINE);
+			restoreCursor();
+		}
+	};
+}
 // src/ui/sweep.ts
 /** Width of the track the broom sweeps across, in columns. */
 const TRACK = 24;
@@ -11545,7 +13625,7 @@ function startSweep(options) {
 	const c = import_picocolors.default.createColors(options.color);
 	const passMs = options.passMs ?? 400;
 	const started = Date.now();
-	const label = shorten(options.label, options.width);
+	const label = fitWidth(options.label, options.width, PREFIX, "end");
 	const draw = (progress) => {
 		const head = Math.round(progress * 27);
 		let track = "";
@@ -11567,12 +13647,6 @@ function startSweep(options) {
 		restoreCursor();
 	};
 }
-function shorten(label, width) {
-	if (width === void 0) return label;
-	const room = width - PREFIX - 1;
-	if (room < 4) return "";
-	return label.length > room ? `…${label.slice(label.length - room + 1)}` : label;
-}
 // src/cli.ts
 /** Runs the CLI with `argv` (user arguments only) and returns the exit code. */
 async function main(argv, io) {
@@ -11589,74 +13663,13 @@ async function main(argv, io) {
 		});
 		program.addHelpText("beforeAll", `\n${banner.join("\n")}\n`);
 	}
-	const scanCommand = program.command("scan", { isDefault: true }).description("scan a repository for risky settings (the default command)").argument("[path]", "directory to scan", ".").option("-d, --details", "explain each finding and how to fix it").addOption(new Option("--fail-on <severity>", "exit with code 1 when a finding is at or above this severity").choices(FAIL_ON).default("low")).option("--json", "print results as JSON").addOption(new Option("--sarif", "print results as SARIF 2.1.0, for GitHub code scanning").conflicts("json")).option("-o, --output <file>", "save the --json or --sarif report to a file, and show the readable report").option("--offline", "skip the checks that call the GitHub API").option("--no-color", "turn off colors");
+	const scanCommand = program.command("scan", { isDefault: true }).description("scan a repository for risky settings (the default command)").argument("[path]", "directory to scan", ".").option("-d, --details", "explain each finding and how to fix it").addOption(new Option("--fail-on <severity>", "exit with code 1 when a finding is at or above this severity").choices(FAIL_ON).default("low")).option("--json", "print results as JSON").addOption(new Option("--sarif", "print results as SARIF 2.1.0, for GitHub code scanning").conflicts("json")).option("-o, --output <file>", "save the --json or --sarif report to a file, and show the readable report").option("--offline", "skip the checks that call the GitHub API").option("--all", `find every project under the path (folders with ${list(PROJECT_MARKERS, "or")}) and scan each one, offline`).option("--no-color", "turn off colors");
+	showDefaultCommandInHelp(program, scanCommand);
 	scanCommand.action(async (target, flags) => {
 		const machine = machineFormat(flags);
 		if (flags.output !== void 0 && !machine) scanCommand.error("error: --output needs --json or --sarif");
-		const readable = !machine || flags.output !== void 0;
-		const color = io.color && flags.color !== false;
-		const animate = io.interactive && readable;
-		const banner = animate && bannerFits(io.width);
-		const shownTarget = displayTarget(target);
-		let scanned = false;
-		const scanning = settle(scan({
-			root: target,
-			offline: flags.offline ?? false,
-			env: io.env,
-			fetch: io.fetch
-		})).finally(() => {
-			scanned = true;
-		});
-		if (banner) await playBanner(io.stdout, {
-			color,
-			version: VERSION,
-			width: io.width
-		});
-		const stopSweep = animate && !(banner && scanned) ? startSweep({
-			write: io.stdout,
-			label: shownTarget,
-			color,
-			width: io.width
-		}) : void 0;
-		const outcome = await scanning;
-		await stopSweep?.();
-		if (!outcome.ok) {
-			if (!isSetupError(outcome.error)) throw outcome.error;
-			io.stderr(`devsweep: ${printable(outcome.error.message)}\n`);
-			exitCode = 2;
-			return;
-		}
-		const result = outcome.value;
-		const readLines = sourceReader(result.root);
-		if (machine) {
-			const report = await formatMachine(machine, result, readLines);
-			if (flags.output === void 0) io.stdout(report);
-			else {
-				const failure = await saveReport(flags.output, report);
-				if (failure) {
-					io.stderr(`devsweep: ${failure}\n`);
-					exitCode = 2;
-					return;
-				}
-			}
-		}
-		if (readable) {
-			let report = formatPretty(result, {
-				target: shownTarget,
-				color,
-				showName: !banner,
-				details: flags.details,
-				width: io.width,
-				readLines
-			});
-			if (machine && flags.output !== void 0) {
-				const name = machine === "sarif" ? "SARIF" : "JSON";
-				report += `  ${import_picocolors.default.createColors(color).dim(`${name} report saved to ${flags.output}`)}\n`;
-			}
-			if (animate) await reveal(io, report);
-			else io.stdout(report);
-		}
-		exitCode = exitCodeFor(result, flags.failOn);
+		if (flags.all && machine === "sarif") scanCommand.error("error: --sarif can't be used with --all: a SARIF report describes one repository, for that repository's Security tab. Use --json, or scan each repository on its own.");
+		exitCode = flags.all ? await runAll(target, flags, machine, io) : await runOne(target, flags, machine, io);
 	});
 	try {
 		await program.parseAsync(argv, { from: "user" });
@@ -11665,6 +13678,160 @@ async function main(argv, io) {
 		throw error;
 	}
 	return exitCode;
+}
+/** `devsweep <path>`: scans one repository. Returns the exit code. */
+async function runOne(target, flags, machine, io) {
+	const readable = !machine || flags.output !== void 0;
+	const color = io.color && flags.color !== false;
+	const animate = io.interactive && readable;
+	const banner = animate && bannerFits(io.width);
+	const shownTarget = displayTarget(target);
+	const result = await runJob(scan({
+		root: target,
+		offline: flags.offline ?? false,
+		env: io.env,
+		fetch: io.fetch
+	}), io, color, banner, animate ? () => startSweep({
+		write: io.stdout,
+		label: shownTarget,
+		color,
+		width: io.width
+	}) : void 0);
+	if (!result) return 2;
+	const readLines = sourceReader(result.root);
+	return await emit(io, flags, color, animate, {
+		machine: machine && {
+			format: machine,
+			text: await formatMachine(machine, result, readLines)
+		},
+		readable: readable && (() => formatPretty(result, {
+			target: shownTarget,
+			color,
+			showName: !banner,
+			details: flags.details,
+			width: io.width,
+			readLines
+		}))
+	}) ? exitCodeFor(result, flags.failOn) : 2;
+}
+/**
+* `devsweep <path> --all`: finds every project under the path and scans each one, offline.
+* Returns the exit code.
+*/
+async function runAll(target, flags, machine, io) {
+	const readable = !machine || flags.output !== void 0;
+	const color = io.color && flags.color !== false;
+	const animate = io.interactive && !machine;
+	const banner = animate && bannerFits(io.width);
+	const shownTarget = displayTarget(target);
+	let latest;
+	let progress;
+	const all = await runJob(scanAll({
+		root: target,
+		env: io.env,
+		onProgress: (p) => {
+			latest = p;
+			progress?.update();
+		}
+	}), io, color, banner, animate ? () => {
+		progress = startProgress({
+			write: io.stdout,
+			text: () => latest ? describeProgress(latest) : `searching ${shownTarget}`,
+			color,
+			width: io.width
+		});
+		return progress.stop;
+	} : void 0);
+	if (!all) return 2;
+	return await emit(io, flags, color, animate, {
+		machine: machine && {
+			format: machine,
+			text: formatJsonAll(all, VERSION)
+		},
+		note: "Network checks are off with --all, as if --offline were passed: checking the GitHub settings of dozens of repositories would hit GitHub’s rate limit. Scan one repository without --all to include them.",
+		readable: readable && (() => formatPrettyAll(all, {
+			target: shownTarget,
+			color,
+			showName: !banner,
+			details: flags.details,
+			width: io.width,
+			readerFor: sourceReader
+		}))
+	}) ? exitCodeForAll(all, flags.failOn) : 2;
+}
+/**
+* Runs a scan while the banner plays, then shows `indicator` (a spinner or progress line) until
+* the scan is done. Returns undefined after printing why when the scan couldn't start.
+*/
+async function runJob(job, io, color, banner, indicator) {
+	let finished = false;
+	const running = settle(job).finally(() => {
+		finished = true;
+	});
+	if (banner) await playBanner(io.stdout, {
+		color,
+		version: VERSION,
+		width: io.width
+	});
+	const stop = indicator && !(banner && finished) ? indicator() : void 0;
+	const outcome = await running;
+	await stop?.();
+	if (outcome.ok) return outcome.value;
+	if (!isSetupError(outcome.error)) throw outcome.error;
+	io.stderr(`devsweep: ${printable(outcome.error.message)}
+`);
+}
+/**
+* Prints or saves the machine report, then shows the readable one. Returns false when the
+* report couldn't be saved.
+*/
+async function emit(io, flags, color, animate, reports) {
+	const { machine } = reports;
+	if (machine) {
+		if (flags.output === void 0) {
+			io.stdout(machine.text);
+			if (reports.note) io.stderr(`devsweep: ${reports.note}
+`);
+		} else {
+			const failure = await saveReport(flags.output, machine.text);
+			if (failure) {
+				io.stderr(`devsweep: ${failure}
+`);
+				return false;
+			}
+		}
+	}
+	if (reports.readable) {
+		let report = reports.readable();
+		if (machine && flags.output !== void 0) {
+			const name = machine.format === "sarif" ? "SARIF" : "JSON";
+			report += `  ${import_picocolors.default.createColors(color).dim(`${name} report saved to ${flags.output}`)}
+`;
+		}
+		if (animate) await reveal(io, report);
+		else io.stdout(report);
+	}
+	return true;
+}
+function describeProgress(progress) {
+	if (progress.stage === "searching") return `searching  ${count(progress.folders)} folders · ${count(progress.projects)} projects found`;
+	return `scanning ${count(progress.done + 1)} of ${count(progress.total)}  ${progress.project}`;
+}
+/**
+* `devsweep --help` lists the default command's argument and options too, since they work
+* without naming the command. Commander shows only the program's own by default.
+*/
+function showDefaultCommandInHelp(program, command) {
+	program.usage("[options] [path]").configureHelp({
+		visibleArguments(cmd) {
+			return Help.prototype.visibleArguments.call(this, cmd === program ? command : cmd);
+		},
+		visibleOptions(cmd) {
+			const own = Help.prototype.visibleOptions.call(this, cmd);
+			if (cmd !== program) return own;
+			return [...Help.prototype.visibleOptions.call(this, command).filter((option) => option.long !== "--help"), ...own];
+		}
+	});
 }
 /** Captures a promise's result, so a failure can't go unhandled while we're busy animating. */
 function settle(promise) {

@@ -146,6 +146,87 @@ describe('formatPretty', () => {
     );
   });
 
+  it('wraps warnings and errors on a narrow terminal instead of cutting them off', () => {
+    const scanned = result([], {
+      warnings: [
+        {
+          checkId: 'repo',
+          message:
+            "Couldn't check GitHub repository settings for octo/demo: no token. Set GITHUB_TOKEN " +
+            'or GH_TOKEN. Pass --offline to skip these checks.',
+        },
+        {
+          checkId: 'workflows',
+          file: '.github/workflows/a.yml',
+          message: 'Skipped invalid YAML: x',
+        },
+      ],
+      errors: [{ checkId: 'code', message: 'something went badly wrong while reading the file' }],
+    });
+    const text = formatPretty(scanned, { target: 'repo', color: false, width: 30 });
+    // Only the warnings and errors: the summary below them isn't wrapped.
+    const notices = text.slice(0, text.indexOf('Scan incomplete')).split('\n');
+    expect(notices.filter((line) => line.length > 30)).toEqual([]);
+    expect(text).not.toContain('…');
+    expect(text).toContain(
+      "  ! Couldn't check GitHub\n" +
+        '    repository settings for\n' +
+        '    octo/demo: no token. Set\n' +
+        '    GITHUB_TOKEN or GH_TOKEN.\n' +
+        '    Pass --offline to skip\n' +
+        '    these checks.\n',
+    );
+    expect(text).toContain('  ! .github/workflows/a.yml\n    Skipped invalid YAML: x\n');
+    expect(text).toContain('  × check "code" failed:\n    something went badly wrong\n');
+  });
+
+  it('keeps two spaces between a warning’s file and its message', () => {
+    const scanned = result([], {
+      warnings: [{ checkId: 'workflows', file: 'a.yml', message: 'Skipped invalid YAML: x' }],
+    });
+    expect(formatPretty(scanned, { target: 'repo', color: false, width: 80 })).toContain(
+      '  ! a.yml  Skipped invalid YAML: x\n',
+    );
+  });
+
+  it('says there was nothing to scan when no file was read', () => {
+    const text = formatPretty(
+      result([], { coverage: { filesRead: false, lookedFor: ['a.yml', 'b.json'], github: false } }),
+      { target: 'repo', color: false },
+    );
+    expect(text).toContain(
+      '  ● Nothing to scan  · 5 ms\n  devsweep looks for a.yml and b.json, and found none here.\n',
+    );
+    expect(text).not.toContain('No issues found');
+  });
+
+  it('says only the GitHub settings were checked, with or without findings', () => {
+    const coverage = { filesRead: false, lookedFor: ['a.yml'], github: true };
+    const note =
+      '  Only the GitHub repository settings were checked. devsweep looks for a.yml, and found none here.\n';
+    const clean = formatPretty(result([], { coverage }), { target: 'repo', color: false });
+    expect(clean).toContain(`  ● No issues found  · 5 ms\n${note}`);
+    const repoFinding: Finding = {
+      ruleId: 'repo/force-push-allowed',
+      severity: 'high',
+      message: 'Force pushes are allowed.',
+      subject: 'branch main',
+    };
+    const found = formatPretty(result([repoFinding], { coverage }), {
+      target: 'repo',
+      color: false,
+    });
+    expect(found).toContain(`1 issue  1 high  · 5 ms\n${note}`);
+  });
+
+  it('says "No issues found" as before when files were read', () => {
+    const text = formatPretty(
+      result([], { coverage: { filesRead: true, lookedFor: ['a.yml'], github: false } }),
+      { target: 'repo', color: false },
+    );
+    expect(text).toMatch(/● No issues found {2}· 5 ms\n$/);
+  });
+
   it('colors severities when color is on', () => {
     const text = formatPretty(result([finding]), { target: 'repo', color: true });
     expect(text).toContain('\u001b[31m● high');

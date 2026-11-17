@@ -1,4 +1,4 @@
-import { type Finding, type ScanResult, SEVERITIES } from './types.js';
+import { type Finding, type ScanAllResult, type ScanResult, SEVERITIES } from './types.js';
 
 /** CI systems read the exit code to pass or fail a job. */
 export const EXIT_OK = 0;
@@ -26,4 +26,11 @@ export function failingFindings(findings: readonly Finding[], failOn: FailOn): F
 export function exitCodeFor(result: ScanResult, failOn: FailOn): number {
   if (result.errors.length > 0) return EXIT_TOOL_ERROR;
   return failingFindings(result.findings, failOn).length > 0 ? EXIT_FINDINGS : EXIT_OK;
+}
+
+/** The worst exit code across every project: a crashed check (2), then findings (1). */
+export function exitCodeForAll(all: ScanAllResult, failOn: FailOn): number {
+  const codes = all.projects.map((project) => exitCodeFor(project.result, failOn));
+  if (codes.includes(EXIT_TOOL_ERROR)) return EXIT_TOOL_ERROR;
+  return codes.includes(EXIT_FINDINGS) ? EXIT_FINDINGS : EXIT_OK;
 }

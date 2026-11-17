@@ -83,7 +83,9 @@ describe('findProjects', () => {
   });
 
   it('skips Windows system folders only at a drive root', () => {
-    for (const root of [path.parse(process.cwd()).root, 'C:\\', '/']) {
+    // C:\ is a drive root only on Windows; elsewhere it's an ordinary folder name.
+    const roots = process.platform === 'win32' ? ['C:\\', 'D:\\'] : ['/'];
+    for (const root of [path.parse(process.cwd()).root, ...roots]) {
       expect(isSkippedFolder('Windows', root)).toBe(true);
       expect(isSkippedFolder('Program Files', root)).toBe(true);
       expect(isSkippedFolder('program files (x86)', root)).toBe(true);
